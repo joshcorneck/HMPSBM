@@ -1,213 +1,220 @@
 import numpy as np
-from scipy.special import digamma, logsumexp
 
+from scipy.special import digamma, logsumexp
+from joblib import Parallel, delayed
 
 class VariationalBayes:
 
-    def __init__(self, num_nodes, num_layers, adj_tensor) -> None:
+    def __init__(self, num_nodes, num_layers, adj_tensor, features) -> None:
         """
         """
         self.num_nodes = num_nodes
         self.num_layers = num_layers
         self.adj_tensor = adj_tensor
+        self.features = features
     
-    
+        # Initialise empty arrays for the variational parameters.
+        self.phi_u = np.zeros((num_layers, num_nodes, M_u))
+        self.phi_w = np.zeros((num_nodes, M_w))
+        self.phi_zeta = np.zeros((M_zeta1, M_zeta2, M_zeta3))
+        self.theta_delta = np.zeros((num_nodes, M_delta))
+        self.sigma_delta = np.zeros((num_nodes, M_delta))
+        self.theta_phi = None
+        self.sigma_phi = None
+        self.alpha_gamma = np.zeros((M_gamma1, M_gamma2))
+        self.beta_gamma = np.zeros((M_gamma1, M_gamma2))
+        self.alpha_pi = np.zeros((M_pi, ))
+        self.beta_pi = np.zeros((M_pi, ))
+        self.alpha_rho = np.zeros((M_rho, M_rho))
+        self.beta_rho = np.zeros((M_rho, M_rho))
 
-# class VariationalBayes:
+    def _update_q_u(self):
+        """
+        """
+        # Precompute frequently used terms outside the loop
+        precomputed_digamma_alpha_rho = (
+            digamma(self.alpha_rho) - digamma(self.alpha_rho + self.beta_rho)
+        )
+        precomputed_digamma_beta_rho = (
+            digamma(self.beta_rho) - digamma(self.alpha_rho + self.beta_rho)
+        )
 
-#     def __init__(self, num_nodes, num_layers, adj_tensor) -> None:
-#         """
-#         """
-#         self.num_nodes = num_nodes
-#         self.num_layers = num_layers
-#         self.adj_tensor = adj_tensor
-
-#     def _compute_q_pi_prime(self, xi_0):
-#         """
-#         """
-#         self.alpha_pi = np.ones((self.M_pi, ))
-#         self.beta_pi = np.ones((self.M_pi, )) * xi_0
-
-#         self.alpha_pi += np.einsum('krm->m', self.phi_zeta)
-#         self.beta_pi += np.einsum('krm->m', 1 - np.cumsum(self.phi_zeta, axis=2))
-
-#     def _compute_q_gamma_prime(self, eta_0):
-#         """
-#         """
-#         self.alpha_gamma = np.ones((self.M_tau, self.M_gamma))
-#         self.beta_gamma = np.ones((self.M_tau, self.M_gamma)) * eta_0
-
-#         self.alpha_gamma += np.einsum('ik,lim->km', self.phi_w, self.phi_u)
-#         self.beta_gamma += np.einsum('ik,lim->km', self.phi_w, 1 - np.cumsum(self.phi_u, axis=2))
-
-#     def _compute_q_tau_prime(self):
-#         """
-#         """
-#         self.alpha_tau = np.ones((self.num_nodes, self.M_tau))
-#         self.beta_tau = np.ones((self.num_nodes, self.M_tau)) * self.y.reshape((self.num_nodes, 1))
-
-#         self.alpha_tau += self.phi_w
-
-#         self.beta_tau += (1 - np.cumsum(self.phi_w, axis=1))
-
-#     def _compute_q_zeta(self):
-#         """
-#         """
-#         self.phi_zeta = np.zeros((self.M_tau, self.M_gamma, self.M_pi))
-
-#         self.phi_zeta += (
-#             digamma(self.alpha_pi) - digamma(self.alpha_pi + self.beta_pi) +
-#             (np.cumsum(digamma(self.alpha_pi) - 
-#                        digamma(self.alpha_pi + self.beta_pi)) - 
-#             digamma(self.alpha_pi) - digamma(self.alpha_pi + self.beta_pi))
-#             )
+        # Non-parallelised computations
+        term = self.phi_w @ (digamma(self.alpha_gamma) - 
+                             digamma(self.alpha_gamma + 
+                                     self.beta_gamma))
+        cumsum = (
+            np.cumsum(digamma(self.beta_gamma) -
+                      digamma(self.alpha_gamma + 
+                              self.beta_gamma), axis=1) -
+            (digamma(self.beta_gamma) -
+             digamma(self.alpha_gamma +
+                     self.beta_gamma))
+        ) 
+        term += self.phi_w @ cumsum
         
-#         self.phi_zeta += np.einsum('ik,jm,lir,ljs,msq,lij,pq->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                    self.phi_zeta, self.adj_tensor,
-#                                    digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_zeta += np.einsum('ik,jm,lir,ljs,msq,lij,pq->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                    self.phi_zeta, 1 - self.adj_tensor,
-#                                    digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_zeta += np.einsum('ik,jm,lir,ljs,msq,lji,qp->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                    self.phi_zeta, self.adj_tensor,
-#                                    digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_zeta += np.einsum('ik,jm,lir,ljs,msq,lji,qp->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                    self.phi_zeta, 1 - self.adj_tensor,
-#                                    digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_zeta -= np.einsum('ik,jk,lir,ljr,lij,pp->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u, self.adj_tensor, 
-#                                    digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_zeta -= np.einsum('ik,jk,lir,ljr,lij,pp->krp',
-#                                    self.phi_w, self.phi_w, self.phi_u, self.phi_u, 1 - self.adj_tensor, 
-#                                    digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-
-#         logsumexp_phi_zeta = logsumexp(self.phi_zeta, axis=2, keepdims=True)
-#         self.phi_zeta = np.exp(self.phi_zeta - logsumexp_phi_zeta)
-
-#     def _compute_q_w(self):
-#         """
-#         """
-#         self.phi_w = np.zeros((self.num_nodes, self.M_tau))
-
-#         self.phi_w += (
-#             digamma(self.alpha_tau) - digamma(self.alpha_tau + self.beta_tau) +
-#             (np.cumsum(digamma(self.beta_tau) -
-#                        digamma(self.alpha_tau + self.beta_tau), axis=1) - 
-#             digamma(self.beta_tau) - digamma(self.alpha_tau + self.beta_tau))
-#         )
-
-#         self.phi_w += np.einsum('jm,lir,ljs,rka,msb,lij,ab->ik',
-#                                 self.phi_w, self.phi_u, self.phi_u, self.phi_zeta, self.phi_zeta,
-#                                 self.adj_tensor, digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_w += np.einsum('jm,lir,ljs,rka,msb,lij,ab->ik',
-#                                 self.phi_w, self.phi_u, self.phi_u, self.phi_zeta, self.phi_zeta,
-#                                 1 - self.adj_tensor, digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_w += np.einsum('jm,lir,ljs,rka,msb,lji,ba->ik',
-#                                 self.phi_w, self.phi_u, self.phi_u, self.phi_zeta, self.phi_zeta,
-#                                 self.adj_tensor, digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_w += np.einsum('jm,lir,ljs,rka,msb,lji,ba->ik',
-#                                 self.phi_w, self.phi_u, self.phi_u, self.phi_zeta, self.phi_zeta,
-#                                 1 - self.adj_tensor, digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_w -= np.einsum('lir,kra,lii,aa->ik',
-#                                 self.phi_u, self.phi_zeta, self.adj_tensor, 
-#                                 digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_w -= np.einsum('lir,kra,lii,aa->ik',
-#                                 self.phi_u, self.phi_zeta, 1 - self.adj_tensor, 
-#                                 digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
+        term = np.tile(term, (self.num_layers, 1, 1))
         
-#         second_term = (np.cumsum(digamma(self.beta_gamma) -
-#                        digamma(self.alpha_gamma + self.beta_gamma), axis=1) - 
-#                     digamma(self.beta_gamma) - digamma(self.alpha_gamma + self.beta_gamma))
-#         self.phi_w += np.einsum('lim,km->ik', self.phi_u, 
-#                                 digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma) +
-#                                 second_term)
+        # Function for paraellelising the computations
+        def compute_einsum_terms(l, i):
+            local_term = np.zeros(M_u)
+
+            ## For comparison with paper: w'=x, u'=v, r'=s
+            # adj_tensor_mask defined to ensure not summing over j=i
+            adj_tensor_mask = self.adj_tensor[l,i,:].copy()
+            adj_tensor_mask[i] = 0
+            local_term += np.einsum('w,jx,jv,wur,xvs,j,rs->u',
+                                    self.phi_w[i, :], self.phi_w, 
+                                    self.phi_u[l, :, :],
+                                    self.phi_zeta, self.phi_zeta,
+                                    adj_tensor_mask,
+                                    precomputed_digamma_alpha_rho,
+                                    optimize=True)
+
+            local_term += np.einsum('w,jx,jv,wur,xvs,j,sr->u',
+                                    self.phi_w[i, :], self.phi_w, 
+                                    self.phi_u[l, :, :],
+                                    self.phi_zeta, self.phi_zeta,
+                                    adj_tensor_mask,
+                                    precomputed_digamma_alpha_rho,
+                                    optimize=True)
+
+            adj_tensor_mask = 1 - self.adj_tensor[l,i,:].copy()
+            adj_tensor_mask[i] = 0
+            local_term += np.einsum('w,jx,jv,wur,xvs,j,rs->u',
+                                    self.phi_w[i, :], self.phi_w, 
+                                    self.phi_u[l, :, :],
+                                    self.phi_zeta, self.phi_zeta,
+                                    adj_tensor_mask,
+                                    precomputed_digamma_beta_rho,
+                                    optimize=True)
+
+            local_term += np.einsum('w,jx,jv,wur,xvs,j,sr->u',
+                                    self.phi_w[i, :], self.phi_w, 
+                                    self.phi_u[l, :, :],
+                                    self.phi_zeta, self.phi_zeta,
+                                    adj_tensor_mask,
+                                    precomputed_digamma_beta_rho,
+                                    optimize=True)
+
+            return local_term
         
-#         logsumexp_phi_w = logsumexp(self.phi_w, axis=1, keepdims=True)
-#         self.phi_w = np.exp(self.phi_w - logsumexp_phi_w)
+        # Parallel computation 
+        term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(l, i) 
+                                            for l in range(self.num_layers) 
+                                            for i in range(self.num_nodes))
 
-#     def _compute_q_u(self):
-#         """
-#         """
-#         self.phi_u = np.zeros((self.num_layers, self.num_nodes, self.M_gamma))
+        # Add results back to phi_u
+        term += np.array(term_updates).reshape(self.num_layers, 
+                                                    self.num_nodes, 
+                                                    -1)
+        self.phi_u = term
 
-#         self.phi_u += (
-#             digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma) +
-#             (np.cumsum(digamma(self.alpha_gamma) - 
-#                        digamma(self.alpha_gamma + self.beta_gamma), axis=1) - 
-#             digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma))
-#             ).sum(axis=0)
+    def _update_q_w(self):
+        """
+        """
+        pass
+
+    def _update_q_zeta(self):
+        """
+        """
+        term = (
+            digamma(self.alpha_pi) - digamma(self.beta_pi) +
+            np.cumsum(digamma(self.beta_pi) - 
+                      digamma(self.alpha_pi + self.beta_pi))
+        )
+        term = np.tile(term, (M_zeta1, M_zeta2, M_zeta3)) # !! M_zeta3 = M_pi !!
+
+        def compute_einsum_terms(k, r):
+            """
+            """
+            # Masks for ensuring we don't sum over unintended indices
+            mask_k = np.ones((M_w,)) 
+            mask_k[k] = 0
+            mask_r = np.ones((M_u,)) 
+            mask_r[r] = 0
+            adj_tensor_mask = self.adj_tensor.copy()
+            for l in range(self.num_layers):
+                np.fill_diagonal(adj_tensor_mask[l], 0)
+            adj_tensor_sub_mask = 1 - self.adj_tensor.copy()
+            for l in range(self.num_layers):
+                np.fill_diagonal(adj_tensor_sub_mask[l], 0)
+
+            term = np.zeros(M_zeta3) 
+
+            term += np.einsum('i,j,li,lj,lij->', self.phi_w[:,k],
+                                    self.phi_w[:,k], self.phi_u[:,:,r],
+                                    self.phi_u[:,:,r], adj_tensor_mask, 
+                                    optimize=True)
+            term *= np.diag(
+                digamma(self.alpha_rho) - 
+                digamma(self.alpha_rho + self.beta_rho)
+            )
+
+            term += np.einsum('i,j,li,lj,lij->', self.phi_w[:,k],
+                                    self.phi_w[:,k], self.phi_u[:,:,r],
+                                    self.phi_u[:,:,r], adj_tensor_sub_mask, 
+                                    optimize=True)
+            term *= np.diag(
+                digamma(self.beta_rho) - 
+                digamma(self.alpha_rho + self.beta_rho)
+            )
+
+            # s' = t
+            term += np.einsum('i,j,li,lj,i,w,jw,li,u,lju,wut,lij,st->s', 
+                            self.phi_w[:,k], self.phi_w[:,k],
+                            self.phi_u[:,:,r], self.phi_u[:,:,r],
+                            self.phi_w[:,k], mask_k, self.phi_w,
+                            self.phi_u[:,:,r],mask_r, self.phi_u,
+                            self.phi_zeta, adj_tensor_mask,
+                            digamma(self.alpha_rho) - 
+                            digamma(self.alpha_rho + self.beta_rho),
+                            optimize=True)    
+
+            term += np.einsum('i,j,li,lj,i,w,jw,li,u,lju,wut,lij,st->s', 
+                            self.phi_w[:,k], self.phi_w[:,k],
+                            self.phi_u[:,:,r], self.phi_u[:,:,r],
+                            self.phi_w[:,k], mask_k, self.phi_w,
+                            self.phi_u[:,:,r],mask_r, self.phi_u,
+                            self.phi_zeta, adj_tensor_sub_mask,
+                            digamma(self.beta_rho) - 
+                            digamma(self.alpha_rho + self.beta_rho),
+                            optimize=True)
             
-#         self.phi_u += np.einsum('ik,jm,ljs,krp,msq,lij,pq->lir',self.phi_w, self.phi_w, self.phi_u, 
-#                                 self.phi_zeta, self.phi_zeta, self.adj_tensor,
-#                                 digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_u += np.einsum('ik,jm,ljs,krp,msq,lij,pq->lir',self.phi_w, self.phi_w, self.phi_u, 
-#                                 self.phi_zeta, self.phi_zeta, 1 - self.adj_tensor,
-#                                 digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_u += np.einsum('ik,jm,ljs,krp,msq,lji,qp->lir',self.phi_w, self.phi_w, self.phi_u, 
-#                                 self.phi_zeta, self.phi_zeta, self.adj_tensor,
-#                                 digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_u += np.einsum('ik,jm,ljs,krp,msq,lji,qp->lir',self.phi_w, self.phi_w, self.phi_u, 
-#                                 self.phi_zeta, self.phi_zeta, 1 - self.adj_tensor,
-#                                 digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_u -= np.einsum('ik,krp,lii,pp->lir', self.phi_w, self.phi_zeta, self.adj_tensor,
-#                                 digamma(self.alpha_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
-#         self.phi_u -= np.einsum('ik,krp,lii,pp->lir', self.phi_w, self.phi_zeta, 1 - self.adj_tensor,
-#                                 digamma(self.beta_sigma) - digamma(self.alpha_sigma + self.beta_sigma))
+            term += np.einsum('i,j,li,lj,i,w,jw,li,u,lju,wut,lji,ts->s', 
+                            self.phi_w[:,k], self.phi_w[:,k],
+                            self.phi_u[:,:,r], self.phi_u[:,:,r],
+                            self.phi_w[:,k], mask_k, self.phi_w,
+                            self.phi_u[:,:,r],mask_r, self.phi_u,
+                            self.phi_zeta, adj_tensor_mask,
+                            digamma(self.alpha_rho) - 
+                            digamma(self.alpha_rho + self.beta_rho),
+                            optimize=True)
+            
+            term += np.einsum('i,j,li,lj,i,w,jw,li,u,lju,wut,lji,ts->s', 
+                            self.phi_w[:,k], self.phi_w[:,k],
+                            self.phi_u[:,:,r], self.phi_u[:,:,r],
+                            self.phi_w[:,k], mask_k, self.phi_w,
+                            self.phi_u[:,:,r],mask_r, self.phi_u,
+                            self.phi_zeta, adj_tensor_sub_mask,
+                            digamma(self.beta_rho) -
+                            digamma(self.alpha_rho + self.beta_rho),
+                            optimize=True)
+
+            return term
+
+        term = Parallel(n_jobs=1)(delayed(compute_einsum_terms)(k, r) 
+                        for k in range(M_zeta1) 
+                        for r in range(M_zeta1)) 
+        term += np.array(term).reshape(M_zeta1, M_zeta2, -1)
+
+        self.phi_zeta = term
+
+    def _update_q_delta(self):
+        """
+        """
+
+    def _update_q_gamma(self):
+        """
+        """
         
-#         logsumexp_phi_u = logsumexp(self.phi_u, axis=2, keepdims=True)
-#         self.phi_u = np.exp(self.phi_u - logsumexp_phi_u)
-        
-#     def _compute_q_sigma(self, alpha_0, beta_0):
-#         """
-#         """
-#         self.alpha_sigma = np.ones((self.M_pi, self.M_pi)) * alpha_0
-#         self.beta_sigma = np.ones((self.M_pi, self.M_pi)) * beta_0
-
-#         self.alpha_sigma += np.einsum('ik,jm,lir,ljs,kra,msb,lij->ab',
-#                                       self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                       self.phi_zeta, self.phi_zeta, self.adj_tensor)
-#         self.beta_sigma += np.einsum('ik,jm,lir,ljs,kra,msb,lij->ab',
-#                                       self.phi_w, self.phi_w, self.phi_u, self.phi_u,
-#                                       self.phi_zeta, self.phi_zeta, 1 - self.adj_tensor)
-
-#     def run_VB(self, M_tau, M_gamma, M_pi, n_cavi, xi_0, eta_0, alpha_0, beta_0, cov_vec, param_vec):
-#         """
-#         """
-#         self.M_tau = M_tau
-#         self.M_gamma = M_gamma
-#         self.M_pi = M_pi
-#         self.y = np.exp(cov_vec @ param_vec)
-
-#         self.alpha_pi = np.random.uniform(size=(self.M_pi, ))
-#         self.beta_pi = np.random.uniform(size=(self.M_pi, )) 
-
-#         self.alpha_gamma = np.random.uniform(size=(self.M_tau, self.M_gamma))
-#         self.beta_gamma = np.random.uniform(size=(self.M_tau, self.M_gamma)) 
-
-#         self.alpha_tau = np.random.uniform(size=(self.num_nodes, self.M_tau))
-#         self.beta_tau = np.random.uniform(size=(self.num_nodes, self.M_tau)) 
-
-#         self.phi_zeta = np.random.uniform(size=(self.M_tau, self.M_gamma, self.M_pi))
-#         self.phi_zeta /= self.phi_zeta.sum(axis=2, keepdims=True)
-
-#         self.phi_w = np.random.uniform(size=(self.num_nodes, self.M_tau))
-#         self.phi_w /= self.phi_w.sum(axis=1, keepdims=True)
-
-#         self.phi_u = np.random.uniform(size=(self.num_layers, self.num_nodes, self.M_gamma))
-#         self.phi_u /= self.phi_u.sum(axis=2, keepdims=True)
-
-#         self.alpha_sigma = np.random.uniform(size=(self.M_pi, self.M_pi))
-#         self.beta_sigma = np.random.uniform(size=(self.M_pi, self.M_pi)) 
-        
-#         for it in range(n_cavi):
-#             self._compute_q_pi_prime(xi_0)
-#             self._compute_q_gamma_prime(eta_0)
-#             self._compute_q_tau_prime()
-#             self._compute_q_zeta()
-#             self._compute_q_w()
-#             self._compute_q_u()
-#             self._compute_q_sigma(alpha_0, beta_0)
