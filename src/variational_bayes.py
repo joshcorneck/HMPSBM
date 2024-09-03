@@ -40,9 +40,10 @@ class VariationalBayes:
         )
 
         # Non-parallelised computations
-        term = self.phi_w @ (digamma(self.alpha_gamma) - 
-                             digamma(self.alpha_gamma + 
-                                     self.beta_gamma))
+        term = np.einsum('iw,wu->iu', self.phi_w,
+                         digamma(self.alpha_gamma) - 
+                         digamma(self.alpha_gamma + 
+                                 self.beta_gamma))
         cumsum = (
             np.cumsum(digamma(self.beta_gamma) -
                       digamma(self.alpha_gamma + 
@@ -51,7 +52,7 @@ class VariationalBayes:
              digamma(self.alpha_gamma +
                      self.beta_gamma))
         ) 
-        term += self.phi_w @ cumsum
+        term += np.einsum('iw,wu->iu', self.phi_w, cumsum)
         
         term = np.tile(term, (self.num_layers, 1, 1))
         
@@ -113,7 +114,67 @@ class VariationalBayes:
     def _update_q_w(self):
         """
         """
-        pass
+        cumsum = (
+            np.cumsum(digamma(self.beta_gamma) -
+                      digamma(self.alpha_gamma + 
+                              self.beta_gamma), axis=1) -
+            (digamma(self.beta_gamma) -
+             digamma(self.alpha_gamma +
+                     self.beta_gamma))
+        )
+        cumsum += (digamma(self.beta_gamma) -
+                   digamma(self.alpha_gamma +
+                           self.beta_gamma)
+        )
+
+        term = np.einsum('liu,wu->iw', self.phi_u, cumsum)
+
+        # Need to include the MCMC step for \E(\log\tau_{iw})
+        #  
+
+
+        def compute_einsum_terms(i):
+            adj_tensor_mask = self.adj_tensor[:, i, :].copy()
+            adj_tensor_mask[:, i] = 0
+            adj_tensor_sub_mask = 1 - self.adj_tensor[:, i, :].copy()
+            adj_tensor_sub_mask[:, i] = 0
+
+            # w'=x, u'=v, r'=s
+            local_term = np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
+                                   self.phi_w, self.phi_u, self.phi_u,
+                                   self.phi_zeta, self.phi_zeta,
+                                   adj_tensor_mask, 
+                                   digamma(self.alpha_rho) - 
+                                   digamma(self.alpha_rho + self.beta_rho))
+            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
+                                   self.phi_w, self.phi_u, self.phi_u,
+                                   self.phi_zeta, self.phi_zeta,
+                                   adj_tensor_sub_mask, 
+                                   digamma(self.beta_rho) - 
+                                   digamma(self.alpha_rho + self.beta_rho))
+            
+            adj_tensor_mask = self.adj_tensor[:, :, i].copy()
+            adj_tensor_mask[:, i] = 0
+            adj_tensor_sub_mask = 1 - self.adj_tensor[:, :, i].copy()
+            adj_tensor_sub_mask[:, i] = 0
+            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
+                                   self.phi_w, self.phi_u, self.phi_u,
+                                   self.phi_zeta, self.phi_zeta,
+                                   adj_tensor_mask, 
+                                   digamma(self.alpha_rho.T) - 
+                                   digamma(self.alpha_rho.T + self.beta_rho.T))
+            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
+                                   self.phi_w, self.phi_u, self.phi_u,
+                                   self.phi_zeta, self.phi_zeta,
+                                   adj_tensor_sub_mask, 
+                                   digamma(self.beta_rho.T) - 
+                                   digamma(self.alpha_rho.T + self.beta_rho.T))
+            
+            return local_term   
+
+        parallel_terms = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(i) 
+                        for i in range(self.num_nodes)) 
+        term += np.array(parallel_terms).reshape(num_nodes, M_w, -1)
 
     def _update_q_zeta(self):
         """
@@ -203,10 +264,10 @@ class VariationalBayes:
 
             return term
 
-        term = Parallel(n_jobs=1)(delayed(compute_einsum_terms)(k, r) 
+        parallel_terms = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(k, r) 
                         for k in range(M_zeta1) 
                         for r in range(M_zeta1)) 
-        term += np.array(term).reshape(M_zeta1, M_zeta2, -1)
+        term += np.array(parallel_terms).reshape(M_zeta1, M_zeta2, -1)
 
         self.phi_zeta = term
 
@@ -217,4 +278,88 @@ class VariationalBayes:
     def _update_q_gamma(self):
         """
         """
+        def compute_einsum_terms_alpha(k, s):
+            return 1 + np.einsum('li,i->',
+                                 self.phi_u[:,:,s],
+                                 self.phi_w[:,k])
         
+        def compute_einsum_terms_beta(k, s):
+            # Mask for sum from r=s+1 to M_u only
+            mask_s = np.zeros((M_u,))
+            mask_s[(s+1):] = 1
+
+            return self.eta_0 + np.einsum('r,lir,i->',
+                                 mask_s,
+                                 self.phi_u,
+                                 self.phi_w[:,k])
+        
+        term = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_alpha)(k, s) 
+                   for k in range(M_gamma1) 
+                   for s in range(M_gamma2)) 
+        
+        self.alpha_gamma = term.reshape((M_gamma1, M_gamma2))
+
+        term = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_beta)(k, s) 
+                   for k in range(M_gamma1) 
+                   for s in range(M_gamma2)) 
+
+        self.beta_gamma = term.reshape((M_gamma1, M_gamma2))
+
+    def _update_q_pi(self):
+        """
+        """
+        self.alpha_pi = 1 + np.einsum('krs->s', self.phi_zeta)
+        beta_temp = np.einsum('krm->m', self.phi_zeta)
+        self.beta_pi = self.xi_0 + beta_temp[::-1].cumsum()[::-1] - beta_temp
+
+    def _update_q_rho(self):
+        """
+        """
+        def compute_einsum_terms_alpha(l,i):
+            adj_tensor_mask = self.adj_tensor[l,i,:].copy()
+            adj_tensor_mask[i] = 0   
+
+            # w' = x, u' = v
+            local_term = np.einsum('j,wuk,xvm,w,jx,u,jv->km',
+                                   adj_tensor_mask, self.phi_zeta,
+                                   self.phi_zeta, self.phi_w[i, :],
+                                   self.phi_w, self.phi_u[l, i, :],
+                                   self.phi_u[l, :, :]
+            )                                 
+
+            return local_term
+
+        def compute_einsum_terms_beta(l,i):
+            adj_tensor_sub_mask = 1 - self.adj_tensor[l,i,:].copy()
+            adj_tensor_sub_mask[i] = 0  
+
+            # w' = x, u' = v
+            local_term = np.einsum('j,wuk,xvm,w,jx,u,jv->km',
+                                   adj_tensor_sub_mask, self.phi_zeta,
+                                   self.phi_zeta, self.phi_w[i, :],
+                                   self.phi_w, self.phi_u[l, i, :],
+                                   self.phi_u[l, :, :]
+            )    
+
+            return local_term
+        
+        # Parallel computation 
+        term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_alpha)(l, i) 
+                                            for l in range(self.num_layers) 
+                                            for i in range(self.num_nodes))
+
+        # Add results back to alpha_rho
+        self.alpha_rho = self.alpha_0
+        self.alpha_rho += np.array(term_updates).reshape(M_rho, 
+                                                         M_rho, 
+                                                         -1).sum(axis=2)
+        
+        term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_beta)(l, i) 
+                                            for l in range(self.num_layers) 
+                                            for i in range(self.num_nodes))
+
+        # Add results back to beta_rho
+        self.beta_rho = self.beta_0
+        self.beta_rho += np.array(term_updates).reshape(M_rho, 
+                                                        M_rho, 
+                                                        -1).sum(axis=2)
