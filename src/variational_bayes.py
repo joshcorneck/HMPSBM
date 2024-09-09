@@ -2,6 +2,7 @@ import numpy as np
 
 from scipy.special import digamma, logsumexp
 from joblib import Parallel, delayed
+from scipy.stats import norm
 
 class VariationalBayes:
 
@@ -12,15 +13,23 @@ class VariationalBayes:
         self.num_layers = num_layers
         self.adj_tensor = adj_tensor
         self.features = features
+        self.P = features.shape[1]
     
         # Initialise empty arrays for the variational parameters.
         self.phi_u = np.zeros((num_layers, num_nodes, M_u))
         self.phi_w = np.zeros((num_nodes, M_w))
         self.phi_zeta = np.zeros((M_zeta1, M_zeta2, M_zeta3))
         self.theta_delta = np.zeros((num_nodes, M_delta))
-        self.sigma_delta = np.zeros((num_nodes, M_delta))
-        self.theta_phi = None
-        self.sigma_phi = None
+        self.sigma2_delta = np.zeros((num_nodes, M_delta)) # This is sigma^2 not sigma
+        self.theta_phi = np.zeros((M_phi, self.P))
+        self.sigma_phi = np.zeros((M_phi, M_phi))
+        self.theta_mu = None
+        self.sigma_mu = None
+        self.nu_sigma2 = None
+        self.omega_sigma2 = None
+        self.mu = None
+        self.nu_0 = None
+        self.omega_0 = None
         self.alpha_gamma = np.zeros((M_gamma1, M_gamma2))
         self.beta_gamma = np.zeros((M_gamma1, M_gamma2))
         self.alpha_pi = np.zeros((M_pi, ))
@@ -111,7 +120,35 @@ class VariationalBayes:
                                                     -1)
         self.phi_u = term
 
-    def _update_q_w(self):
+    def _delta_sampler(self, num_mc):
+        """
+        Function to sample values for delta for the current estimates of
+        the variationl parameters.
+        """
+        delta_ik_samps = np.zeros((self.num_nodes, M_delta, num_mc))
+        rng = np.random.default_rng() # Speed improvement with this sampler
+        for i in range(self.num_nodes):
+            for k in range(M_delta):
+                delta_ik_samps[i,k,:] = rng.normal(self.theta_delta[i,k],
+                                                   np.sqrt(self.sigma_delta[i,k]),
+                                                   size=num_mc)
+                
+        # Optional with JIT to speed-up computation
+        # delta = np.random.zeros((self.num_nodes, M_delta, num_mc))
+        # @njit(parallel=True)
+        # def generate_delta(delta, a, b):
+        #     for i in prange(1000):  # prange enables parallel loops
+        #         for k in range(10):
+        #             delta[i, k, :] = np.random.normal(a[i, k], b[i, k], size=(num_mc))
+        #     return delta
+        
+        # self.delta_ik_samps = generate_delta(self.delta_ik_samps, 
+        #                                      self.theta_delta, 
+        #                                      np.sqrt(self.sigma_delta))
+
+        return delta_ik_samps
+    
+    def _update_q_w(self, num_mc):
         """
         """
         cumsum = (
@@ -129,9 +166,15 @@ class VariationalBayes:
 
         term = np.einsum('liu,wu->iw', self.phi_u, cumsum)
 
-        # Need to include the MCMC step for \E(\log\tau_{iw})
-        #  
+        # MC step for the expectation
+        delta_ik_samps = self._delta_sampler(num_mc)  
 
+        # Compute the approximation of the expectation using the samples
+        tau = np.zeros((self.num_nodes, M_delta, num_mc))
+        tau[:,1:,:] = (1 - norm.cdf(delta_ik_samps[:,:-1,:]).cumprod(axis=1))
+        tau *= norm.cdf(delta_ik_samps)
+
+        term += np.log(tau).mean(axis=2) # !! M_w = M_delta !! 
 
         def compute_einsum_terms(i):
             adj_tensor_mask = self.adj_tensor[:, i, :].copy()
@@ -271,9 +314,76 @@ class VariationalBayes:
 
         self.phi_zeta = term
 
-    def _update_q_delta(self):
+    def _update_q_delta(self, num_mc, num_grad_steps, 
+                        alpha=0.001, beta1=0.9, beta2=0.999, eps=10**-8):
         """
+        Uses an ADAM optimiser to go
         """
+        # Dot products
+        X_dot_X = np.sum(self.features ** 2, axis=1) # Shape (self.num_nodes, )
+        X_dot_theta_phi = self.features @ self.theta_phi.T # Shape (self.num_nodes, M_phi)
+
+        # ADAM parameters
+        first_moment_theta = np.zeros((self.num_nodes, M_delta))
+        first_moment_sigma2 = np.zeros((self.num_nodes, M_delta))
+        second_moment_theta = np.zeros((self.num_nodes, M_delta))
+        second_moment_sigma2 = np.zeros((self.num_nodes, M_delta))
+
+        for step in range(num_grad_steps):
+            # Skip the zero-index
+            step += 1
+
+            # Empty arrays for gradients
+            grad_theta = np.zeros((self.num_nodes, M_delta))
+            grad_sigma2 = np.zeros((self.num_nodes, M_delta))
+
+            # Sample delta using current variational parameter values
+            delta_ik_samps = self._delta_sampler(num_mc)
+
+            # Approximate the expectation using MC
+            expectation_theta_mc = (
+                (delta_ik_samps - np.tile(self.theta_delta[:,:,np.newaxis], (1,1,num_mc)))
+                * np.log(norm.cdf(delta_ik_samps)).mean(axis=2)
+            ) # Shape (self.num_nodes, M_delta)
+
+            expectation_sigma_mc = (
+                ((delta_ik_samps - np.tile(self.theta_delta[:,:,np.newaxis], (1,1,num_mc))) ** 2 
+                - np.tile(self.sigma2_delta[:,:,np.newaxis], (1,1,num_mc)) ** 2) * 
+                np.log(norm.cdf(delta_ik_samps)).mean(axis=2)
+            ) # Shape (self.num_nodes, M_delta)
+
+            grad_theta = (
+                -(self.nu_sigma2 / self.omega_sigma2) * (1 / X_dot_X[:,np.newaxis]) * self.theta_delta 
+                + self.nu_sigma2 / self.omega_sigma2 * X_dot_theta_phi / (1 / X_dot_X[:,np.newaxis])
+                + (1 / self.sigma2_delta) * expectation_theta_mc *
+                    np.cumsum(self.phi_w[:,::-1], axis=1)[:, ::-1]
+            )
+
+            grad_sigma2 = (
+                -(self.nu_sigma2 / self.omega_sigma2) * (1 / (2 * X_dot_X[:,np.newaxis]))
+                + (1 / (2 * self.sigma2_delta ** 2)) * expectation_sigma_mc * 
+                    np.cumsum(self.phi_w[:,::-1], axis=1)[:, ::-1]
+            )
+
+            # ADAM steps
+            first_moment_theta = beta1 * first_moment_theta + (1 - beta1) * grad_theta
+            second_moment_theta = beta2 * second_moment_theta + (1 - beta2) * grad_theta ** 2
+            first_moment_sigma2 = beta1 * first_moment_sigma2 + (1 - beta1) * grad_sigma2
+            second_moment_sigma2 = beta2 * second_moment_sigma2 + (1 - beta2) * grad_sigma2 ** 2
+
+            first_moment_theta_bias = first_moment_theta / (1 - beta1 ** step)
+            second_moment_theta_bias = second_moment_theta / (1 - beta2 ** step)
+            first_moment_sigma2_bias = first_moment_sigma2 / (1 - beta1 ** step)
+            second_moment_sigma2_bias = second_moment_sigma2 / (1 - beta2 ** step)
+    
+            self.theta_delta = (
+                self.theta_delta 
+                + alpha * first_moment_theta_bias / (np.sqrt(second_moment_theta_bias) + eps)
+            )
+            self.sigma2_delta = (
+                self.sigma2_delta 
+                + alpha * first_moment_sigma2_bias / (np.sqrt(second_moment_sigma2_bias) + eps)
+            ) # Note the + here as we try to maximise the ELBO
 
     def _update_q_gamma(self):
         """
@@ -363,3 +473,20 @@ class VariationalBayes:
         self.beta_rho += np.array(term_updates).reshape(M_rho, 
                                                         M_rho, 
                                                         -1).sum(axis=2)
+    
+    def _compute_q_mu(self):
+        """
+        """
+        self.theta_mu = (self.theta_phi + self.mu) / 2
+        self.sigma_mu = 2 * np.eye(M_phi)
+
+    def _compute_q_sigma2(self):
+        """
+        """
+        self.nu_sigma2 = self.nu_0 + self.num_nodes / 2
+        self.omega_sigma2 = (
+            self.omega_0 + np.sum(
+                ((self.theta_delta - self.features @ self.theta_phi.T) ** 2 + self.sigma2_delta)
+                / (2 * np.sum(self.features ** 2, axis=1)), axis=0)
+        )
+        
