@@ -1,12 +1,13 @@
 import numpy as np
 
-from scipy.special import digamma, logsumexp
+from scipy.special import digamma
 from joblib import Parallel, delayed
 from scipy.stats import norm
 
 class VariationalBayes:
 
-    def __init__(self, num_nodes, num_layers, adj_tensor, features) -> None:
+    def __init__(self, num_nodes, num_layers, adj_tensor, features,
+                 M_w, M_u, M_zeta) -> None:
         """
         """
         self.num_nodes = num_nodes
@@ -14,15 +15,16 @@ class VariationalBayes:
         self.adj_tensor = adj_tensor
         self.features = features
         self.P = features.shape[1]
+        self.M_w = M_w; self.M_u = M_u; self.M_zeta = M_zeta
     
         # Initialise empty arrays for the variational parameters.
         self.phi_u = np.zeros((num_layers, num_nodes, M_u))
         self.phi_w = np.zeros((num_nodes, M_w))
-        self.phi_zeta = np.zeros((M_zeta1, M_zeta2, M_zeta3))
-        self.theta_delta = np.zeros((num_nodes, M_delta))
-        self.sigma2_delta = np.zeros((num_nodes, M_delta)) # This is sigma^2 not sigma
-        self.theta_phi = np.zeros((M_phi, self.P))
-        self.sigma_phi = np.zeros((M_phi, M_phi))
+        self.phi_zeta = np.zeros((M_w, M_u, M_zeta))
+        self.theta_delta = np.zeros((num_nodes, M_w))
+        self.sigma2_delta = np.zeros((num_nodes, M_w)) # This is sigma^2 not sigma
+        self.theta_phi = np.zeros((self.P, M_w))
+        self.sigma_phi = np.zeros((self.P, M_w, M_w))
         self.theta_mu = None
         self.sigma_mu = None
         self.nu_sigma2 = None
@@ -30,12 +32,12 @@ class VariationalBayes:
         self.mu = None
         self.nu_0 = None
         self.omega_0 = None
-        self.alpha_gamma = np.zeros((M_gamma1, M_gamma2))
-        self.beta_gamma = np.zeros((M_gamma1, M_gamma2))
-        self.alpha_pi = np.zeros((M_pi, ))
-        self.beta_pi = np.zeros((M_pi, ))
-        self.alpha_rho = np.zeros((M_rho, M_rho))
-        self.beta_rho = np.zeros((M_rho, M_rho))
+        self.alpha_gamma = np.zeros((M_w, M_u))
+        self.beta_gamma = np.zeros((M_w, M_u))
+        self.alpha_pi = np.zeros((M_zeta, ))
+        self.beta_pi = np.zeros((M_zeta, ))
+        self.alpha_rho = np.zeros((M_zeta, M_zeta))
+        self.beta_rho = np.zeros((M_zeta, M_zeta))
 
     def _update_q_u(self):
         """
@@ -67,7 +69,7 @@ class VariationalBayes:
         
         # Function for paraellelising the computations
         def compute_einsum_terms(l, i):
-            local_term = np.zeros(M_u)
+            local_term = np.zeros(self.M_u)
 
             ## For comparison with paper: w'=x, u'=v, r'=s
             # adj_tensor_mask defined to ensure not summing over j=i
@@ -125,10 +127,10 @@ class VariationalBayes:
         Function to sample values for delta for the current estimates of
         the variationl parameters.
         """
-        delta_ik_samps = np.zeros((self.num_nodes, M_delta, num_mc))
+        delta_ik_samps = np.zeros((self.num_nodes, self.M_w, num_mc))
         rng = np.random.default_rng() # Speed improvement with this sampler
         for i in range(self.num_nodes):
-            for k in range(M_delta):
+            for k in range(self.M_w):
                 delta_ik_samps[i,k,:] = rng.normal(self.theta_delta[i,k],
                                                    np.sqrt(self.sigma_delta[i,k]),
                                                    size=num_mc)
@@ -170,11 +172,11 @@ class VariationalBayes:
         delta_ik_samps = self._delta_sampler(num_mc)  
 
         # Compute the approximation of the expectation using the samples
-        tau = np.zeros((self.num_nodes, M_delta, num_mc))
+        tau = np.zeros((self.num_nodes, self.M_w, num_mc))
         tau[:,1:,:] = (1 - norm.cdf(delta_ik_samps[:,:-1,:]).cumprod(axis=1))
         tau *= norm.cdf(delta_ik_samps)
 
-        term += np.log(tau).mean(axis=2) # !! M_w = M_delta !! 
+        term += np.log(tau).mean(axis=2) 
 
         def compute_einsum_terms(i):
             adj_tensor_mask = self.adj_tensor[:, i, :].copy()
@@ -217,7 +219,7 @@ class VariationalBayes:
 
         parallel_terms = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(i) 
                         for i in range(self.num_nodes)) 
-        term += np.array(parallel_terms).reshape(num_nodes, M_w, -1)
+        term += np.array(parallel_terms).reshape(self.num_nodes, self.M_w, -1)
 
     def _update_q_zeta(self):
         """
@@ -227,15 +229,15 @@ class VariationalBayes:
             np.cumsum(digamma(self.beta_pi) - 
                       digamma(self.alpha_pi + self.beta_pi))
         )
-        term = np.tile(term, (M_zeta1, M_zeta2, M_zeta3)) # !! M_zeta3 = M_pi !!
+        term = np.tile(term, (self.M_w, self.M_u, self.M_zeta)) # !! M_zeta3 = M_pi !!
 
         def compute_einsum_terms(k, r):
             """
             """
             # Masks for ensuring we don't sum over unintended indices
-            mask_k = np.ones((M_w,)) 
+            mask_k = np.ones((self.M_w,)) 
             mask_k[k] = 0
-            mask_r = np.ones((M_u,)) 
+            mask_r = np.ones((self.M_u,)) 
             mask_r[r] = 0
             adj_tensor_mask = self.adj_tensor.copy()
             for l in range(self.num_layers):
@@ -244,7 +246,7 @@ class VariationalBayes:
             for l in range(self.num_layers):
                 np.fill_diagonal(adj_tensor_sub_mask[l], 0)
 
-            term = np.zeros(M_zeta3) 
+            term = np.zeros(self.M_zeta) 
 
             term += np.einsum('i,j,li,lj,lij->', self.phi_w[:,k],
                                     self.phi_w[:,k], self.phi_u[:,:,r],
@@ -308,9 +310,9 @@ class VariationalBayes:
             return term
 
         parallel_terms = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(k, r) 
-                        for k in range(M_zeta1) 
-                        for r in range(M_zeta1)) 
-        term += np.array(parallel_terms).reshape(M_zeta1, M_zeta2, -1)
+                        for k in range(self.M_w) 
+                        for r in range(self.M_u)) 
+        term += np.array(parallel_terms).reshape(self.M_w, self.M_u, -1)
 
         self.phi_zeta = term
 
@@ -324,18 +326,18 @@ class VariationalBayes:
         X_dot_theta_phi = self.features @ self.theta_phi.T # Shape (self.num_nodes, M_phi)
 
         # ADAM parameters
-        first_moment_theta = np.zeros((self.num_nodes, M_delta))
-        first_moment_sigma2 = np.zeros((self.num_nodes, M_delta))
-        second_moment_theta = np.zeros((self.num_nodes, M_delta))
-        second_moment_sigma2 = np.zeros((self.num_nodes, M_delta))
+        first_moment_theta = np.zeros((self.num_nodes, self.M_w))
+        first_moment_sigma2 = np.zeros((self.num_nodes, self.M_w))
+        second_moment_theta = np.zeros((self.num_nodes, self.M_w))
+        second_moment_sigma2 = np.zeros((self.num_nodes, self.M_w))
 
         for step in range(num_grad_steps):
             # Skip the zero-index
             step += 1
 
             # Empty arrays for gradients
-            grad_theta = np.zeros((self.num_nodes, M_delta))
-            grad_sigma2 = np.zeros((self.num_nodes, M_delta))
+            grad_theta = np.zeros((self.num_nodes, self.M_w))
+            grad_sigma2 = np.zeros((self.num_nodes, self.M_w))
 
             # Sample delta using current variational parameter values
             delta_ik_samps = self._delta_sampler(num_mc)
@@ -385,6 +387,28 @@ class VariationalBayes:
                 + alpha * first_moment_sigma2_bias / (np.sqrt(second_moment_sigma2_bias) + eps)
             ) # Note the + here as we try to maximise the ELBO
 
+    def _update_q_phi(self):
+        """
+        """
+        # Compute \sum_i x_ix_i^T/(x_i^Tx_i)
+        outer_products = np.einsum('ij,ik->ijk', self.features, self.features)
+        normalisation_terms = np.einsum('ij,ij->i', self.features, self.features)
+        # For Sigma computation
+        normalised_matrix = (
+            np.sum(outer_products / normalisation_terms[:, np.newaxis, np.newaxis], axis=0)
+        )
+        # For theta computation
+        pre_multiplied = (
+            self.mu.reshape(-1,1) + np.einsum('k,ik,ip,i->kp', self.nu_sigma2 / self.omega_sigma2, 
+                                              self.theta_delta, self.features, 1/normalisation_terms)
+        )
+
+        for k in range(self.P):
+            self.sigma_phi[k,:,:] = np.linalg.inv(
+                np.eye(self.P) + self.nu_sigma2[k] / self.omega_sigma2[k] * normalised_matrix
+            )
+            self.theta_phi[k,:] = self.sigma_phi[k,:,:] @ pre_multiplied[k,:]
+
     def _update_q_gamma(self):
         """
         """
@@ -395,7 +419,7 @@ class VariationalBayes:
         
         def compute_einsum_terms_beta(k, s):
             # Mask for sum from r=s+1 to M_u only
-            mask_s = np.zeros((M_u,))
+            mask_s = np.zeros((self.M_u,))
             mask_s[(s+1):] = 1
 
             return self.eta_0 + np.einsum('r,lir,i->',
@@ -404,16 +428,16 @@ class VariationalBayes:
                                  self.phi_w[:,k])
         
         term = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_alpha)(k, s) 
-                   for k in range(M_gamma1) 
-                   for s in range(M_gamma2)) 
+                   for k in range(self.M_w) 
+                   for s in range(self.M_u)) 
         
-        self.alpha_gamma = term.reshape((M_gamma1, M_gamma2))
+        self.alpha_gamma = term.reshape((self.M_w, self.M_u))
 
         term = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_beta)(k, s) 
-                   for k in range(M_gamma1) 
-                   for s in range(M_gamma2)) 
+                   for k in range(self.M_w) 
+                   for s in range(self.M_u)) 
 
-        self.beta_gamma = term.reshape((M_gamma1, M_gamma2))
+        self.beta_gamma = term.reshape((self.M_w, self.M_u))
 
     def _update_q_pi(self):
         """
@@ -460,8 +484,8 @@ class VariationalBayes:
 
         # Add results back to alpha_rho
         self.alpha_rho = self.alpha_0
-        self.alpha_rho += np.array(term_updates).reshape(M_rho, 
-                                                         M_rho, 
+        self.alpha_rho += np.array(term_updates).reshape(self.M_zeta, 
+                                                         self.M_zeta, 
                                                          -1).sum(axis=2)
         
         term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_beta)(l, i) 
@@ -470,15 +494,15 @@ class VariationalBayes:
 
         # Add results back to beta_rho
         self.beta_rho = self.beta_0
-        self.beta_rho += np.array(term_updates).reshape(M_rho, 
-                                                        M_rho, 
+        self.beta_rho += np.array(term_updates).reshape(self.M_zeta, 
+                                                        self.M_zeta, 
                                                         -1).sum(axis=2)
     
     def _compute_q_mu(self):
         """
         """
         self.theta_mu = (self.theta_phi + self.mu) / 2
-        self.sigma_mu = 2 * np.eye(M_phi)
+        self.sigma_mu = 2 * np.eye(self.M_w)
 
     def _compute_q_sigma2(self):
         """
@@ -489,4 +513,10 @@ class VariationalBayes:
                 ((self.theta_delta - self.features @ self.theta_phi.T) ** 2 + self.sigma2_delta)
                 / (2 * np.sum(self.features ** 2, axis=1)), axis=0)
         )
-        
+
+    def run_VB_scheme(self, num_mc: int):
+        """
+        Run the full VB update scheme.
+        Parameter:
+            - num_mc: number of MC samples for expectation estimates.
+        """
