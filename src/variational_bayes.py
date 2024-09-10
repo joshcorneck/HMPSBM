@@ -6,9 +6,16 @@ from scipy.stats import norm
 
 class VariationalBayes:
 
-    def __init__(self, num_nodes, num_layers, adj_tensor, features,
-                 M_w, M_u, M_zeta) -> None:
+    def __init__(self, num_nodes: int, num_layers: int, adj_tensor: np.array, 
+                 features: np.array, M_w: int, M_u: int, M_zeta: int) -> None:
         """
+        A class to compute a mean-field variational approximation to the posterior.
+        Parameters:
+            - num_nodes: number of nodes in the network (N).
+            - num_layers: number of layers in the network (L).
+            - adj_tensor: adjacency tensor for the network, of shape (L,N,N).
+            - features: features for each node of the network, of shape (N,P).
+            - M_w, M_u, M_zeta: values for variational approximation truncation.
         """
         self.num_nodes = num_nodes
         self.num_layers = num_layers
@@ -41,6 +48,7 @@ class VariationalBayes:
 
     def _update_q_u(self):
         """
+        A method for computing the variational approximation for each u_{\ell i}
         """
         # Precompute frequently used terms outside the loop
         precomputed_digamma_alpha_rho = (
@@ -122,10 +130,12 @@ class VariationalBayes:
                                                     -1)
         self.phi_u = term
 
-    def _delta_sampler(self, num_mc):
+    def _delta_sampler(self, num_mc: int):
         """
-        Function to sample values for delta for the current estimates of
+        A method to sample values for delta for the current estimates of
         the variationl parameters.
+        Parameters:
+            - num_mc: the number of MC samples.
         """
         delta_ik_samps = np.zeros((self.num_nodes, self.M_w, num_mc))
         rng = np.random.default_rng() # Speed improvement with this sampler
@@ -150,8 +160,12 @@ class VariationalBayes:
 
         return delta_ik_samps
     
-    def _update_q_w(self, num_mc):
+    def _update_q_w(self, num_mc: int):
         """
+        A method for computing the variational approximation for each w_i.
+        Parameters:
+            - num_mc: the number of MC samples used for the MC approximation to the 
+                      expectation of delta.
         """
         cumsum = (
             np.cumsum(digamma(self.beta_gamma) -
@@ -223,6 +237,7 @@ class VariationalBayes:
 
     def _update_q_zeta(self):
         """
+        A method for computing the variational approximation for each \zeta_{k,r}.
         """
         term = (
             digamma(self.alpha_pi) - digamma(self.beta_pi) +
@@ -316,10 +331,16 @@ class VariationalBayes:
 
         self.phi_zeta = term
 
-    def _update_q_delta(self, num_mc, num_grad_steps, 
-                        alpha=0.001, beta1=0.9, beta2=0.999, eps=10**-8):
+    def _update_q_delta(self, num_mc: int, num_grad_steps: int, 
+                        alpha: float=0.001, beta1: float=0.9, beta2: float=0.999, 
+                        eps: float=10**-8):
         """
-        Uses an ADAM optimiser to go
+        A method for computing the variational approximation for each \delta_{ik}. This
+        uses an ADAM optimiser to perform the gradient ascent steps to maximise the ELBO.
+        Parameters:
+            - num_mc: number of MC samples for expectation approximations.
+            - num_grad_steps: number of ADAM steps to compute.
+            - alpah, beta1, beta2, eps: standard ADAM parameters.
         """
         # Dot products
         X_dot_X = np.sum(self.features ** 2, axis=1) # Shape (self.num_nodes, )
@@ -389,6 +410,7 @@ class VariationalBayes:
 
     def _update_q_phi(self):
         """
+        A method for computing the variational approximation for each \phi_k,
         """
         # Compute \sum_i x_ix_i^T/(x_i^Tx_i)
         outer_products = np.einsum('ij,ik->ijk', self.features, self.features)
@@ -411,6 +433,7 @@ class VariationalBayes:
 
     def _update_q_gamma(self):
         """
+        A method for computing the variational approximation for each \gamma_{rs}.
         """
         def compute_einsum_terms_alpha(k, s):
             return 1 + np.einsum('li,i->',
@@ -441,6 +464,7 @@ class VariationalBayes:
 
     def _update_q_pi(self):
         """
+        A method for computing the variational approximation for \pi.
         """
         self.alpha_pi = 1 + np.einsum('krs->s', self.phi_zeta)
         beta_temp = np.einsum('krm->m', self.phi_zeta)
@@ -448,6 +472,7 @@ class VariationalBayes:
 
     def _update_q_rho(self):
         """
+        A method for computing the variational approximation for each \rho_{km}.
         """
         def compute_einsum_terms_alpha(l,i):
             adj_tensor_mask = self.adj_tensor[l,i,:].copy()
@@ -498,14 +523,16 @@ class VariationalBayes:
                                                         self.M_zeta, 
                                                         -1).sum(axis=2)
     
-    def _compute_q_mu(self):
+    def _update_q_mu(self):
         """
+        A method for computing the variational approximation for each \mu_k.
         """
         self.theta_mu = (self.theta_phi + self.mu) / 2
         self.sigma_mu = 2 * np.eye(self.M_w)
 
-    def _compute_q_sigma2(self):
+    def _update_q_sigma2(self):
         """
+        A method for computing the variational approximation for each \sigma_k^2.
         """
         self.nu_sigma2 = self.nu_0 + self.num_nodes / 2
         self.omega_sigma2 = (
@@ -514,9 +541,25 @@ class VariationalBayes:
                 / (2 * np.sum(self.features ** 2, axis=1)), axis=0)
         )
 
-    def run_VB_scheme(self, num_mc: int):
+    def run_VB_scheme(self, n_CAVI_its: int, num_mc: int, num_grad_steps: int):
         """
         Run the full VB update scheme.
         Parameter:
+            - n_CAVI_its: number of CAVI iterations.
             - num_mc: number of MC samples for expectation estimates.
+            - num_grad_steps: number of gradient ascent steps in the ADAM procedure.
         """
+        for rep in range(n_CAVI_its):
+            print(f"Iteration {rep + 1} of {n_CAVI_its}")
+            
+            self._update_q_u()
+            self._update_q_w(num_mc)
+            self._update_q_zeta()
+            self._update_q_delta(num_mc, num_grad_steps)
+            self._update_q_phi()
+            self._update_q_gamma()
+            self._update_q_pi()
+            self._update_q_rho()
+            self._update_q_mu()
+            self._update_q_sigma2()
+
