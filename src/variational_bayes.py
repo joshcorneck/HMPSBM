@@ -1,21 +1,20 @@
 import numpy as np
 
-from scipy.special import digamma, logsumexp
+from scipy.special import gamma, loggamma, digamma, logsumexp
 from joblib import Parallel, delayed
 from scipy.stats import norm
 from scipy.linalg import svd
-from sklearn.cluster import DBSCAN, KMeans
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import confusion_matrix
 
-import time
-import hdbscan
+import src.helper_functions.initialise_parameters as initialise
+from src.helper_functions.compute_ELBO import *
 
 class VariationalBayes:
 
     def __init__(self, num_nodes: int, num_layers: int, adj_tensor: np.array, 
-                 features: np.array, M_w: int, M_u: int, M_zeta: int,
-                 num_fp_its: int=1) -> None:
+                 features: np.array, M_w: int, M_u: int, 
+                 num_fp_its: int=1, degree_correction: bool=False, k_max: int = 4) -> None:
         """
         A class to compute a mean-field variational approximation to the posterior.
         Parameters:
@@ -23,7 +22,8 @@ class VariationalBayes:
             - num_layers: number of layers in the network (L).
             - adj_tensor: adjacency tensor for the network, of shape (L,N,N).
             - features: features for each node of the network, of shape (N,P).
-            - M_w, M_u, M_zeta: values for variational approximation truncation.
+            - M_w, M_u: values for variational approximation truncation.
+            - k_max: embedding dimension used for initialisation.
         """
         self.num_fp_its = num_fp_its
         self.num_nodes = num_nodes
@@ -31,28 +31,8 @@ class VariationalBayes:
         self.adj_tensor = adj_tensor
         self.features = features
         self.P = features.shape[1]
-        self.M_w = M_w; self.M_u = M_u; self.M_zeta = M_zeta
-    
-        # Initialise empty arrays for the variational parameters.
-        self.phi_u = np.random.uniform(size=(num_layers, num_nodes, M_u))
-        # self.phi_u /= self.phi_u.sum(axis=2, keepdims=True)
-        
-        self.phi_w = np.random.uniform(size=(num_nodes, M_w))
-        # self.phi_w /= self.phi_w.sum(axis=1, keepdims=True)
-        
-        self.phi_zeta = np.random.uniform(size=(M_w, M_u, M_zeta))
-        self.phi_zeta /= self.phi_zeta.sum(axis=2, keepdims=True)
-        
-        self.theta_phi0 = np.zeros((M_w, self.P))
-        self.sigma_phi0 = np.ones((M_w, self.P, self.P))
-        
-        self.theta_phi = np.zeros((M_w, self.P))
-        self.sigma_phi = np.ones((M_w, self.P, self.P))
-        
-        cov_mat = np.cov(self.features.T)
-        for m in range(M_w):
-            self.sigma_phi0[m,:,:] = cov_mat
-            self.sigma_phi[m,:,:] = cov_mat
+        self.M_w = M_w; self.M_u = M_u        
+        self.k_max = k_max
             
         self.nu_sigma2 = np.ones((M_w, ))
         self.omega_sigma2 = np.ones((M_w, ))
@@ -62,208 +42,195 @@ class VariationalBayes:
         self.omega_0 = 1
         self.alpha_0 = 1
         self.beta_0 = 1
-        self.xi_0 = 1
-        self.eta_0 = 1
-        
-        self.alpha_gamma = np.random.uniform(size=(M_w, M_u))
-        self.beta_gamma = np.random.uniform(size=(M_w, M_u))
-        self.alpha_pi = np.random.uniform(size=(M_zeta, ))
-        self.beta_pi = np.random.uniform(size=(M_zeta, ))
-        self.alpha_rho = np.random.uniform(size=(M_zeta, M_zeta))
-        self.beta_rho = np.random.uniform(size=(M_zeta, M_zeta))
+        self.eta_0 = 1 / self.M_u
         
     def _initialise_parameters(self):
         """
+        Initialise all parameter values.
         """
-        # Embedding dimension
-        k_max = 4
-
-        # Store the embeddings
-        left_embed = np.zeros((self.um_nodes, self.num_layers, k_max))
-
-        # Layer clusterings
-        layer_left_clusterings = np.zeros((self.num_nodes, self.num_layers))
-
-        def assign_clusters(X, M):
-            """
-            """
-            # Compute the clustering (ensure <= M_u labels)
-            hdb = hdbscan.HDBSCAN()
-            clustering = hdb.fit(X)
-            labels = clustering.labels_
-            num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-            # Cut the tree to obtain M clusters
-            while num_clusters > M:
-                # Increase the minimum cluster size to merge smaller clusters
-                hdb.min_cluster_size += 1
-                clustering = hdb.fit(X)
-                labels = clustering.labels_
-                num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        # Initialise phi_u
+        self.phi_u = initialise.initialise_phi_u(self.num_nodes, self.num_layers,
+                                                 self.k_max, self.M_u, self.adj_tensor)
+        
+        # Initialise phi_w
+        self.phi_w = initialise.initialise_phi_w(self.num_nodes, self.num_layers, 
+                                                 self.k_max, self.M_w, self.features, 
+                                                 self.adj_tensor)
+        
+        # Initialise alpha_rho and beta_rho
+        self.alpha_rho, self.beta_rho = (
+            initialise.initialise_alpha_beta_rho(self.num_layers, self.M_u, self.adj_tensor,
+                                                 self.phi_u)
+        )
+        
+        # Initialise alpha_gamma and beta_gamma
+        self.alpha_gamma, self.beta_gamma = (
+            initialise.initialise_alpha_beta_gamma(self.adj_tensor, self.phi_w,
+                                                   self.phi_u)
+        )
+        
+        # Initialise theta_phi, theta_phi0, sigma_phi and sigma_phi0
+        self.theta_phi = np.stack(initialise.initialise_theta_phi(self.features, self.phi_w))
+        self.theta_phi0 = np.ones((self.M_w, self.P))
+        
+        cov_mat = np.cov(self.features.T)
+        self.sigma_phi = np.ones((self.M_w, self.P, self.P))
+        self.sigma_phi0 = np.ones((self.M_w, self.P, self.P))
+        for m in range(self.M_w):
+            self.sigma_phi0[m,:,:] = cov_mat
+            self.sigma_phi[m,:,:] = cov_mat
             
-            return num_clusters, clustering.labels_
-
-        def assign_outliers(num_outliers, clustering, X, num_clusters, 
-                            k_max):
-            """
-            """
-            # Assign those with a -1 label to the group to whose centroid the
-            # outlier is cloest to
-            cluster_centroids = np.zeros((num_clusters, k_max))
-            l2_distances = np.zeros((num_outliers, num_clusters))
-            for cluster in range(num_clusters):
-                cluster_idxs = clustering == cluster
-                cluster_centroid = X[cluster_idxs, :].mean(axis=0)
-                cluster_centroids[cluster, :] = cluster_centroid 
-                l2_distances[:,cluster] = np.linalg.norm(
-                    X[outlier_idxs,:] - cluster_centroid, axis=1
-                )
-            outlier_assignments = np.argmin(l2_distances, axis=1)
-            
-            return outlier_assignments
-
-        # Embed each layer
-        for l in range(self.num_layers):
-            A_l = self.adj_tensor[l,:,:]
-            U, Sigma, Vt = svd(A_l)
-            # Left and right eigenvectors
-            left_evecs = U[:,:k_max]; right_evecs = Vt.T[:,:k_max]
-            #Compute the embeddings
-            Sigma_half = np.sqrt(Sigma)
-            X = left_evecs @ np.diag(Sigma_half[:k_max])
-            X_prime = right_evecs @ np.diag(Sigma_half[:k_max])
-            # Store
-            left_embed[:,l,:] = X
-            
-            # Compute the left_embedding clustering (ensure <= M_u labels)
-            num_clusters, layer_left_clusterings[:,l] = assign_clusters(X, self.M_u)
-            
-            # Assign those with a -1
-            outlier_idxs = layer_left_clusterings[:,l] == -1
-            if outlier_idxs.sum() != 0:
-                layer_left_clusterings[outlier_idxs, l] = (
-                    assign_outliers(outlier_idxs.sum(), layer_left_clusterings[:,l],
-                                    X, num_clusters, k_max)
-                )
-            
-            # Initiliase phi_u
-            self.phi_u[l,np.arange(self.num_nodes),
-                       layer_left_clusterings[:,l].astype(int)] = 1
-            
-        # Embed the average adjacency matrix
-        A_avg = self.adj_tensor.mean(axis=0)
-        U, Sigma, Vt = svd(A_avg)
-        left_evecs = U[:,:k_max]; right_evecs = Vt.T[:,:k_max]
-        X = left_evecs @ np.diag(Sigma_half[:k_max])
-        X_prime = right_evecs @ np.diag(Sigma_half[:k_max])
-
-        # Compute the right_embedding clustering (ensure <= M_u labels)
-        num_clusters, global_left_clusterings = assign_clusters(X, self.M_w)
-
-        # Assign those with a -1 label
-        outlier_idxs = global_left_clusterings == -1
-        if outlier_idxs.sum() != 0:
-            global_left_clusterings[outlier_idxs] = (
-                assign_outliers(outlier_idxs.sum(), global_left_clusterings,
-                                X, num_clusters, k_max)
-            )
-            
-        self.phi_w[np.arange(self.num_nodes), global_left_clusterings] = 1
-
+    
     def _update_q_u(self):
         """
         A method for computing the variational approximation for each u_{\ell i}
         """
-        # Precompute frequently used terms outside the loop
-        precomputed_digamma_alpha_rho = (
-            digamma(self.alpha_rho) - digamma(self.alpha_rho + self.beta_rho)
+        # Precompute frequently used terms outside the loop (avoiding zeros)
+        precomputed_digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+        precomputed_digamma_beta_rho = np.zeros_like(self.beta_rho)
+        valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+        precomputed_digamma_alpha_rho[valid_mask] = (
+            digamma(self.alpha_rho[valid_mask]) 
+            - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
         )
-        precomputed_digamma_beta_rho = (
-            digamma(self.beta_rho) - digamma(self.alpha_rho + self.beta_rho)
+        precomputed_digamma_beta_rho[valid_mask] = (
+            digamma(self.beta_rho[valid_mask]) 
+            - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
         )
 
         # Non-parallelised computations
-        term = np.einsum('iw,wu->iu', self.phi_w,
-                         digamma(self.alpha_gamma) - 
-                         digamma(self.alpha_gamma + 
-                                 self.beta_gamma))
         cumsum = (
+            digamma(self.alpha_gamma) - 
+            digamma(self.alpha_gamma + 
+                    self.beta_gamma) + 
             np.cumsum(digamma(self.beta_gamma) -
                       digamma(self.alpha_gamma + 
                               self.beta_gamma), axis=1) -
             (digamma(self.beta_gamma) -
              digamma(self.alpha_gamma +
                      self.beta_gamma))
-        ) 
-        term += np.einsum('iw,wu->iu', self.phi_w, cumsum)
+        )
         
+        term = np.einsum('iw,wu->iu', self.phi_w, cumsum)
         term = np.tile(term, (self.num_layers, 1, 1))
         
         # Function for paraellelising the computations
-        def compute_einsum_terms_u(l, i):
+        def compute_einsum_terms_u(l, i, term):
             # THIS IS TO BE REFORMATTED.
-            local_term = term[l,i,:]
+            local_term = term.copy()
 
             ## For comparison with paper: w'=x, u'=v, r'=s
             # adj_tensor_mask defined to ensure not summing over j=i
             adj_tensor_mask = self.adj_tensor[l, i, :].copy()
             adj_tensor_mask[i] = 0
-            local_term += np.einsum('w,jx,jv,wur,xvs,j,rs->u',
-                                    self.phi_w[i, :], self.phi_w, 
+            local_term += np.einsum('jm,j,km->k', 
                                     self.phi_u[l, :, :],
-                                    self.phi_zeta, self.phi_zeta,
                                     adj_tensor_mask,
                                     precomputed_digamma_alpha_rho,
                                     optimize=True)
 
             adj_tensor_mask = self.adj_tensor[l, :, i].copy()
             adj_tensor_mask[i] = 0
-            local_term += np.einsum('w,jx,jv,wur,xvs,j,sr->u',
-                                    self.phi_w[i, :], self.phi_w, 
+            local_term += np.einsum('jm,j,mk->k',
                                     self.phi_u[l, :, :],
-                                    self.phi_zeta, self.phi_zeta,
                                     adj_tensor_mask,
                                     precomputed_digamma_alpha_rho,
                                     optimize=True)
 
             adj_tensor_mask = 1 - self.adj_tensor[l,i,:].copy()
             adj_tensor_mask[i] = 0
-            local_term += np.einsum('w,jx,jv,wur,xvs,j,rs->u',
-                                    self.phi_w[i, :], self.phi_w, 
+            local_term += np.einsum('jm,j,km->k',
                                     self.phi_u[l, :, :],
-                                    self.phi_zeta, self.phi_zeta,
                                     adj_tensor_mask,
                                     precomputed_digamma_beta_rho,
                                     optimize=True)
 
             adj_tensor_mask = 1 - self.adj_tensor[l,:,i].copy()
             adj_tensor_mask[i] = 0
-            local_term += np.einsum('w,jx,jv,wur,xvs,j,sr->u',
-                                    self.phi_w[i, :], self.phi_w, 
+            local_term += np.einsum('jm,j,mk->k', 
                                     self.phi_u[l, :, :],
-                                    self.phi_zeta, self.phi_zeta,
                                     adj_tensor_mask,
                                     precomputed_digamma_beta_rho,
                                     optimize=True)
 
             return local_term
         
-        # Parallel computation 
-        # term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(l, i) 
-        #                                     for l in range(self.num_layers) 
-        #                                     for i in range(self.num_nodes))
-
-        # # Add results back to phi_u
-        # term += np.array(term_updates).reshape(self.num_layers, 
-        #                                        self.num_nodes, 
-        #                                        -1)
         for CAVI_rep in range(self.num_fp_its):
-            start = time.time()
             for l in range(self.num_layers):
                 for i in range(self.num_nodes):
-                    phi_temp = compute_einsum_terms_u(l,i)
+                    phi_temp = compute_einsum_terms_u(l, i, term[l,i,:])
                     self.phi_u[l,i,:] = np.exp(phi_temp - logsumexp(phi_temp))
-            end = time.time()
-            print(f"phi_u: paralellised CAVI rep {CAVI_rep}: {end - start}")
+    
+    def _compute_ELBO_wrt_u(self, CAVI_rep: int, idx: int):
+        """
+        """
+        
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+            digamma_beta_rho = np.zeros_like(self.beta_rho)
+            valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+            digamma_alpha_rho[valid_mask] = (
+                digamma(self.alpha_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            digamma_beta_rho[valid_mask] = (
+                digamma(self.beta_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 1: p(A | z, \rho)
+            adj_tensor_mask = self.adj_tensor.copy()
+            adj_tensor_sub_mask = self.adj_tensor.copy()
+            for l in range(self.num_layers):
+                np.fill_diagonal(adj_tensor_mask[l,:,:], 0)
+                np.fill_diagonal(adj_tensor_sub_mask[l,:,:], 0)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_mask, digamma_alpha_rho,
+                              optimize=True)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_sub_mask, digamma_beta_rho,
+                              optimize=True)
+            
+            # Term 3: p(z | w, \gamma)
+            cumsum_gamma = (
+                digamma_alpha_gamma + 
+                np.cumsum(digamma_beta_gamma, axis=1) -
+                digamma_beta_gamma
+                )
+                
+            ELBO_temp += np.einsum('lik,iw,wk->', self.phi_u, self.phi_w,
+                              cumsum_gamma,
+                              optimize=True)
+            
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            # Term 1: q(z)
+            ELBO_temp += (self.phi_u * np.log(self.phi_u + 10e-10)).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_u[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
         
     def _sample_phi(self, num_mc: int):
         """
@@ -294,6 +261,39 @@ class VariationalBayes:
                 
         return delta_ik_samps
     
+    def _compute_tau(self, num_mc: int, phi_k_samps: np.array = None):
+        """
+        """
+        if phi_k_samps is None:
+            phi_k_samps = self._sample_phi(num_mc)
+        
+        delta_ik_samps = np.zeros((self.num_nodes, self.M_w, num_mc))
+        for i in range(self.num_nodes):
+            for k in range(self.M_w):
+                delta_ik_samps[i,k,:] = np.dot(self.features[i,:], phi_k_samps[k])
+                
+        tau_ik_samps = np.zeros_like(delta_ik_samps)
+        for i in range(self.num_nodes):
+            for k in range(self.M_w):
+                if k == 0:
+                    tau_ik_samps[i,k,:] = norm.cdf(delta_ik_samps[i,k,:])
+                else:
+                    tau_ik_samps[i,k,:] = (
+                        norm.cdf(delta_ik_samps[i,k,:]) *
+                        (1 - norm.cdf(delta_ik_samps[i,:k,:])).prod(axis=0)
+                    )
+                    
+        # Normalise
+        row_sums = tau_ik_samps.sum(axis=1, keepdims=True)
+
+        # Avoid division by zero by setting zero sums to 1 temporarily
+        row_sums[row_sums == 0] = 1
+
+        # Perform element-wise division, rows with original zero sums will remain unchanged
+        tau_ik_samps = tau_ik_samps / row_sums
+                
+        return tau_ik_samps
+    
     def _update_q_w(self, num_mc: int):
         """
         A method for computing the variational approximation for each w_i.
@@ -302,6 +302,9 @@ class VariationalBayes:
                       expectation of delta.
         """
         cumsum = (
+            digamma(self.alpha_gamma) - 
+            digamma(self.alpha_gamma + 
+                    self.beta_gamma) +
             np.cumsum(digamma(self.beta_gamma) -
                       digamma(self.alpha_gamma + 
                               self.beta_gamma), axis=1) -
@@ -309,241 +312,68 @@ class VariationalBayes:
              digamma(self.alpha_gamma +
                      self.beta_gamma))
         )
-
+    
         term = np.einsum('liu,wu->iw', self.phi_u, cumsum)
 
         # MC step for the expectation
-        delta_ik_samps = self._compute_delta(num_mc)
-        self.delta_ik_samps = delta_ik_samps
-
-        # Compute the approximation of the expectation using the samples
-        tau = np.zeros((self.num_nodes, self.M_w, num_mc))
-        tau[:,1:,:] = (1 - norm.cdf(delta_ik_samps[:,:-1,:]).cumprod(axis=1))
-        tau *= norm.cdf(delta_ik_samps)
-        tau += 10e-10 # For numerical stability
-
-        term += np.log(tau).mean(axis=2)
-
-        def compute_einsum_terms_w(i):
-            """
-            """
-            # THIS IS TO BE REFORMATTED
-            local_term = term[i,:]
-            
-            adj_tensor_mask = self.adj_tensor[:, i, :].copy()
-            adj_tensor_mask[:, i] = 0
-            adj_tensor_sub_mask = 1 - self.adj_tensor[:, i, :].copy()
-            adj_tensor_sub_mask[:, i] = 0
-
-            # w'=x, u'=v, r'=s
-            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
-                                   self.phi_w, self.phi_u[:,i,:], self.phi_u,
-                                   self.phi_zeta, self.phi_zeta,
-                                   adj_tensor_mask, 
-                                   digamma(self.alpha_rho) - 
-                                   digamma(self.alpha_rho + self.beta_rho),
-                                   optimize=True)
-            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
-                                   self.phi_w, self.phi_u[:,i,:], self.phi_u,
-                                   self.phi_zeta, self.phi_zeta,
-                                   adj_tensor_sub_mask, 
-                                   digamma(self.beta_rho) - 
-                                   digamma(self.alpha_rho + self.beta_rho),
-                                   optimize=True)
-            
-            adj_tensor_mask = self.adj_tensor[:, :, i].copy()
-            adj_tensor_mask[:, i] = 0
-            adj_tensor_sub_mask = 1 - self.adj_tensor[:, :, i].copy()
-            adj_tensor_sub_mask[:, i] = 0
-            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,sr->w',
-                                   self.phi_w, self.phi_u[:,i,:], self.phi_u,
-                                   self.phi_zeta, self.phi_zeta,
-                                   adj_tensor_mask, 
-                                   digamma(self.alpha_rho) - 
-                                   digamma(self.alpha_rho + self.beta_rho),
-                                   optimize=True)
-            local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,sr->w',
-                                   self.phi_w, self.phi_u[:,i,:], self.phi_u,
-                                   self.phi_zeta, self.phi_zeta,
-                                   adj_tensor_sub_mask, 
-                                   digamma(self.beta_rho) - 
-                                   digamma(self.alpha_rho + self.beta_rho),
-                                   optimize=True)
-            
-            return local_term
-        
-        # def compute_einsum_terms_w_temp(i):
-        #     """
-        #     Compute the einsum terms and normalize for a given node i.
-        #     """
-        #     local_term = term[i, :].copy()
-
-        #     adj_tensor_mask = self.adj_tensor[:, i, :].copy()
-        #     adj_tensor_mask[:, i] = 0
-        #     adj_tensor_sub_mask = 1 - self.adj_tensor[:, i, :].copy()
-        #     adj_tensor_sub_mask[:, i] = 0
-
-        #     # Compute the local term using einsum operations
-        #     local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
-        #                             self.phi_w, self.phi_u[:, i, :], self.phi_u,
-        #                             self.phi_zeta, self.phi_zeta,
-        #                             adj_tensor_mask,
-        #                             digamma(self.alpha_rho) - 
-        #                             digamma(self.alpha_rho + self.beta_rho),
-        #                             optimize=True)
-        #     local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,rs->w',
-        #                             self.phi_w, self.phi_u[:, i, :], self.phi_u,
-        #                             self.phi_zeta, self.phi_zeta,
-        #                             adj_tensor_sub_mask,
-        #                             digamma(self.beta_rho) - 
-        #                             digamma(self.alpha_rho + self.beta_rho),
-        #                             optimize=True)
-
-        #     adj_tensor_mask = self.adj_tensor[:, :, i].copy()
-        #     adj_tensor_mask[:, i] = 0
-        #     adj_tensor_sub_mask = 1 - self.adj_tensor[:, :, i].copy()
-        #     adj_tensor_sub_mask[:, i] = 0
-
-        #     local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,sr->w',
-        #                             self.phi_w, self.phi_u[:, i, :], self.phi_u,
-        #                             self.phi_zeta, self.phi_zeta,
-        #                             adj_tensor_mask,
-        #                             digamma(self.alpha_rho) - 
-        #                             digamma(self.alpha_rho + self.beta_rho),
-        #                             optimize=True)
-        #     local_term += np.einsum('jx,lu,ljv,wur,xvs,lj,sr->w',
-        #                             self.phi_w, self.phi_u[:, i, :], self.phi_u,
-        #                             self.phi_zeta, self.phi_zeta,
-        #                             adj_tensor_sub_mask,
-        #                             digamma(self.beta_rho) - 
-        #                             digamma(self.alpha_rho + self.beta_rho),
-        #                             optimize=True)
-
-        #     # Normalize the local term
-        #     phi_temp_normalized = np.exp(local_term - logsumexp(local_term))
-
-        #     return i, phi_temp_normalized   
-
-        # for CAVI_rep in range(self.num_fp_its):
-        #     start = time.time()
-        #     results = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_w_temp)(i) 
-        #                               for i in range(self.num_nodes))
-        #     for i, phi_temp_normalized in results:
-        #         self.phi_w[i, :] = phi_temp_normalized
-        #     end = time.time()
-        #     print(f"phi_w: paralellised CAVI rep {CAVI_rep}: {end - start}")
-            
-        for CAVI_rep in range(self.num_fp_its):
-            start = time.time()
-            for i in range(self.num_nodes):
-                phi_temp = compute_einsum_terms_w(i)
-                self.phi_w[i,:] = np.exp(phi_temp - logsumexp(phi_temp))
-            end = time.time()
-            print(f"Non-paralellised CAVI rep: {end - start}")
-        
-    def _update_q_zeta(self):
-        """
-        A method for computing the variational approximation for each \zeta_{k,r}.
-        """
-        term = (
-            np.cumsum(digamma(self.beta_pi) - 
-                      digamma(self.alpha_pi + self.beta_pi)) - 
-            digamma(self.alpha_pi) - digamma(self.beta_pi)
-        )
-        term = np.tile(term, (self.M_w, self.M_u, 1))
-
-        def compute_einsum_terms_zeta(k, r):
-            """
-            """
-            # Add the \psi(\alpha_pi) terms
-            local_term = term[k, r, :]
-                        
-            # Masks for ensuring that we don't sum over unintended indices
-            mask = np.ones((self.M_w, self.M_u))
-            mask[k, r] = 0
-
-            adj_tensor_mask = self.adj_tensor.copy()
-            for l in range(self.num_layers):
-                np.fill_diagonal(adj_tensor_mask[l], 0)
-            adj_tensor_sub_mask = 1 - self.adj_tensor.copy()
-            for l in range(self.num_layers):
-                np.fill_diagonal(adj_tensor_sub_mask[l], 0)
-
-            temp_term = np.einsum('i,j,li,lj,lij->', self.phi_w[:,k],
-                                    self.phi_w[:,k], self.phi_u[:,:,r],
-                                    self.phi_u[:,:,r], adj_tensor_mask, 
-                                    optimize=True)
-            
-            temp_term = temp_term * np.diag(
-                digamma(self.alpha_rho) - 
-                digamma(self.alpha_rho + self.beta_rho)
-            )
-            
-            local_term += temp_term
-
-            temp_term = np.einsum('i,j,li,lj,lij->', self.phi_w[:,k],
-                                    self.phi_w[:,k], self.phi_u[:,:,r],
-                                    self.phi_u[:,:,r], adj_tensor_sub_mask, 
-                                    optimize=True)
-            temp_term = temp_term * np.diag(
-                digamma(self.beta_rho) - 
-                digamma(self.alpha_rho + self.beta_rho)
-            )
-            
-            local_term += temp_term
-
-            # s' = t
-            local_term += np.einsum('i,jw,li,lju,wut,wu,lij,st->s',
-                            self.phi_w[:,k], self.phi_w,
-                            self.phi_u[:,:,r], self.phi_u,
-                            self.phi_zeta, mask, adj_tensor_mask,
-                            digamma(self.alpha_rho) - 
-                            digamma(self.alpha_rho + self.beta_rho),
-                            optimize=True)    
-
-            local_term += np.einsum('i,jw,li,lju,wut,wu,lij,st->s',
-                            self.phi_w[:,k], self.phi_w,
-                            self.phi_u[:,:,r], self.phi_u,
-                            self.phi_zeta, mask, adj_tensor_sub_mask,
-                            digamma(self.beta_rho) - 
-                            digamma(self.alpha_rho + self.beta_rho),
-                            optimize=True)
-            
-            local_term += np.einsum('i,jw,li,lju,wut,wu,lji,ts->s', 
-                            self.phi_w[:,k], self.phi_w,
-                            self.phi_u[:,:,r], self.phi_u,
-                            self.phi_zeta, mask, adj_tensor_mask,
-                            digamma(self.alpha_rho) - 
-                            digamma(self.alpha_rho + self.beta_rho),
-                            optimize=True)
-            
-            local_term += np.einsum('i,jw,li,lju,wut,wu,lji,ts->s', 
-                            self.phi_w[:,k], self.phi_w,
-                            self.phi_u[:,:,r], self.phi_u,
-                            self.phi_zeta, mask, adj_tensor_sub_mask,
-                            digamma(self.beta_rho) - 
-                            digamma(self.alpha_rho + self.beta_rho),
-                            optimize=True)
-
-            return local_term
-
-        # parallel_terms = Parallel(n_jobs=-1)(delayed(compute_einsum_terms)(k, r) 
-        #                 for k in range(self.M_w) 
-        #                 for r in range(self.M_u)) 
-        # term += np.array(parallel_terms).reshape(self.M_w, self.M_u, self.M_zeta)
+        tau_ik_samps = self._compute_tau(num_mc)
+        tau_expec = np.log(tau_ik_samps + 10e-10).mean(axis=2)
+        term += tau_expec
     
-        # self.phi_zeta = term / term.sum(axis=2, keepdims=True)
+        # Take exponential and normalise
+        for i in range(self.num_nodes):
+            self.phi_w[i,:] = np.exp(term[i,:] - logsumexp(term[i,:]))
+            
+    def _compute_ELBO_wrt_w(self, CAVI_rep: int, num_mc: int, idx: int):
+        """
+        """
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 3: p(z | w, \gamma)
+            cumsum_gamma = (
+                digamma_alpha_gamma + 
+                np.cumsum(digamma_beta_gamma, axis=1) -
+                digamma_beta_gamma
+                )
+                
+            ELBO_temp += np.einsum('lik,iw,wk->', self.phi_u, self.phi_w,
+                              cumsum_gamma,
+                              optimize=True)
+            
+            # Term 4: p(w | \tau)
+            # MC step for the expectation
+            tau_ik_samps = self._compute_tau(num_mc)
+            log_tau_expec = np.log(tau_ik_samps + 10e-10).mean(axis=2)
+            
+            ELBO_temp += np.einsum('iw,iw->', self.phi_w, log_tau_expec)
+            
+            return ELBO_temp
         
-        for CAVI_rep in range(self.num_fp_its):
-            start = time.time()
-            for k in range(self.M_w):
-                for r in range(self.M_u):
-                    phi_temp = compute_einsum_terms_zeta(k,r)
-                    self.phi_zeta[k,r,:] = np.exp(phi_temp - logsumexp(phi_temp))
-            end = time.time()
-            print(f"phi_zeta: paralellised CAVI rep {CAVI_rep}: {end - start}")
-
-
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+    
+            # Term 3: q(w)
+            ELBO_temp += (self.phi_w * np.log(self.phi_w + 10e-10)).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_w[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
+        
     def _update_q_phi(self, num_mc: int, num_grad_steps: int, CAVI_rep: int,
                       alpha: float=0.001, beta1: float=0.9, beta2: float=0.999, 
                       eps: float=10**-8):
@@ -770,7 +600,7 @@ class VariationalBayes:
                  0.5 * np.log(np.linalg.det(self.sigma_phi) + 10e-10)
                  )
         
-        self.ELBO_store[CAVI_rep, step, :] = ELBO
+        self.ELBO_store_phi[CAVI_rep, step, :] = ELBO
 
     def _update_q_phi0(self):
         """
@@ -786,6 +616,51 @@ class VariationalBayes:
                 (self.omega_sigma2[k]) / (self.nu_sigma2[k] + self.omega_sigma2[k]) * np.eye(self.P)
             )
         
+    def _compute_ELBO_wrt_phi0(self, CAVI_rep: int, num_mc: int, idx: int):
+        """
+        """
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+            
+            # Term 5: p(\phi | \phi^0, \sigma^2)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -0.5 * self.P * (np.log(self.nu_sigma2[k]) - self.omega_sigma2[k]) -
+                    0.5 * self.nu_sigma2[k] / self.omega_sigma2[k] * (
+                        np.dot(self.theta_phi[k] - self.theta_phi0[k],
+                               self.theta_phi[k] - self.theta_phi0[k]) +
+                        np.trace(self.sigma_phi[k] + np.trace(self.sigma_phi0[k]))
+                    )
+                )
+                
+            # Term 6: p(\phi^0)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -0.5 * np.dot(self.theta_phi0[k] - self.mu,
+                                  self.theta_phi0[k] - self.mu) -
+                    0.5 * np.trace(self.sigma_phi0[k])
+                )
+ 
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            # Term 6: q(\phi^0)
+            for k in range(self.M_w):
+                ELBO_temp += -0.5 * np.log(np.linalg.det(self.sigma_phi0[k]) + 10e-10)
+        
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_phi0[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
+        
     def _update_q_sigma2(self):
         """
         A method for computing the variational approximation for each \sigma_k^2.
@@ -796,6 +671,56 @@ class VariationalBayes:
             np.sum((self.theta_phi - self.theta_phi0) ** 2, axis=1) / 2 +
             np.trace(self.sigma_phi, axis1=1, axis2=2) / 2 + 
             np.trace(self.sigma_phi0, axis1=1, axis2=2) / 2
+        )
+
+    def _compute_ELBO_wrt_sigma2(self, CAVI_rep: int, idx: int):
+        """
+        """
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+
+            # Term 5: p(\phi | \phi^0, \sigma^2)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -0.5 * self.P * (np.log(self.nu_sigma2[k] + 10e-10) - self.omega_sigma2[k]) -
+                    0.5 * self.nu_sigma2[k] / self.omega_sigma2[k] * (
+                        np.dot(self.theta_phi[k] - self.theta_phi0[k],
+                               self.theta_phi[k] - self.theta_phi0[k]) +
+                        np.trace(self.sigma_phi[k] + np.trace(self.sigma_phi0[k]))
+                    )
+                )
+                
+            # Term 7: p(\sigma^2)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -(self.nu_0 + 1) * (np.log(self.nu_sigma2[k]) - self.omega_sigma2[k]) -
+                    self.omega_0 * self.nu_sigma2[k] / self.omega_sigma2[k]
+                )
+            
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            # Term 7: q(\sigma^2)
+            ELBO_temp += (
+                -(self.nu_sigma2 + 1) * (
+                    np.log(self.omega_sigma2 + 10e-10) - 
+                    digamma(self.omega_sigma2)
+                    )
+                - self.nu_sigma2 + self.nu_sigma2 * np.log(self.omega_sigma2 + 10e-10) 
+                - loggamma(self.nu_sigma2)
+            ).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_sigma2[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
         )
 
     def _update_q_gamma(self):
@@ -828,14 +753,64 @@ class VariationalBayes:
                    for s in range(self.M_u)) 
 
         self.beta_gamma = np.array(term).reshape((self.M_w, self.M_u))
-
-    def _update_q_pi(self):
+    
+    def _compute_ELBO_wrt_gamma(self, CAVI_rep: int, idx: int):
         """
-        A method for computing the variational approximation for \pi.
         """
-        self.alpha_pi = 1 + np.einsum('krs->s', self.phi_zeta)
-        beta_temp = np.einsum('krm->m', self.phi_zeta)
-        self.beta_pi = self.xi_0 + beta_temp[::-1].cumsum()[::-1] - beta_temp
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 3: p(z | w, \gamma)
+            cumsum_gamma = (
+                digamma_alpha_gamma + 
+                np.cumsum(digamma_beta_gamma, axis=1) -
+                digamma_beta_gamma
+                )
+                
+            ELBO_temp += np.einsum('lik,iw,wk->', self.phi_u, self.phi_w,
+                              cumsum_gamma,
+                              optimize=True)
+            
+            # Term 8: p(\gamma')
+            ELBO_temp += (self.nu_0 - 1) * digamma_beta_gamma.sum()
+            
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 4: q(gamma')
+            ELBO_temp += (
+                (self.alpha_gamma - 1) * digamma_alpha_gamma + 
+                (self.beta_gamma - 1) * digamma_beta_gamma +
+                loggamma(self.alpha_gamma + self.beta_gamma) -
+                loggamma(self.alpha_gamma) - loggamma(self.beta_gamma)
+            ).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_gamma[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
 
     def _update_q_rho(self):
         """
@@ -844,12 +819,10 @@ class VariationalBayes:
         def compute_einsum_terms_alpha(l,i):
             adj_tensor_mask = self.adj_tensor[l,i,:].copy()
             adj_tensor_mask[i] = 0   
-
+            
             # w' = x, u' = v
-            local_term = np.einsum('j,wuk,xvm,w,jx,u,jv->km',
-                                   adj_tensor_mask, self.phi_zeta,
-                                   self.phi_zeta, self.phi_w[i, :],
-                                   self.phi_w, self.phi_u[l, i, :],
+            local_term = np.einsum('j,k,jm->km',
+                                   adj_tensor_mask, self.phi_u[l, i, :],
                                    self.phi_u[l, :, :]
             )                                 
 
@@ -860,12 +833,11 @@ class VariationalBayes:
             adj_tensor_sub_mask[i] = 0  
 
             # w' = x, u' = v
-            local_term = np.einsum('j,wuk,xvm,w,jx,u,jv->km',
-                                   adj_tensor_sub_mask, self.phi_zeta,
-                                   self.phi_zeta, self.phi_w[i, :],
-                                   self.phi_w, self.phi_u[l, i, :],
+            local_term = np.einsum('j,k,jm->km',
+                                   adj_tensor_sub_mask, 
+                                   self.phi_u[l, i, :],
                                    self.phi_u[l, :, :]
-            )    
+            )   
 
             return local_term
         
@@ -876,9 +848,7 @@ class VariationalBayes:
 
         # Add results back to alpha_rho
         self.alpha_rho = self.alpha_0
-        self.alpha_rho += np.array(term_updates).reshape(self.M_zeta, 
-                                                         self.M_zeta, 
-                                                         -1).sum(axis=2)
+        self.alpha_rho += np.array(term_updates).sum(axis=0)
         
         term_updates = Parallel(n_jobs=-1)(delayed(compute_einsum_terms_beta)(l, i) 
                                             for l in range(self.num_layers) 
@@ -886,15 +856,249 @@ class VariationalBayes:
 
         # Add results back to beta_rho
         self.beta_rho = self.beta_0
-        self.beta_rho += np.array(term_updates).reshape(self.M_zeta, 
-                                                        self.M_zeta, 
-                                                        -1).sum(axis=2)
+        self.beta_rho += np.array(term_updates).sum(axis=0)
         
-    def _compute_full_ELBO(self):
+    def _compute_ELBO_wrt_rho(self, CAVI_rep: int, idx: int):
         """
         """
-        pass
-
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+            digamma_beta_rho = np.zeros_like(self.beta_rho)
+            valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+            digamma_alpha_rho[valid_mask] = (
+                digamma(self.alpha_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            digamma_beta_rho[valid_mask] = (
+                digamma(self.beta_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            
+            # Term 1: p(A | z, \rho)
+            adj_tensor_mask = self.adj_tensor.copy()
+            adj_tensor_sub_mask = self.adj_tensor.copy()
+            for l in range(self.num_layers):
+                np.fill_diagonal(adj_tensor_mask[l,:,:], 0)
+                np.fill_diagonal(adj_tensor_sub_mask[l,:,:], 0)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_mask, digamma_alpha_rho,
+                              optimize=True)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_sub_mask, digamma_beta_rho,
+                              optimize=True)
+            
+            # Term 2: p(\rho)
+            ELBO_temp += (self.alpha_0 - 1) * digamma_alpha_rho.sum() 
+            ELBO_temp += (self.beta_0 - 1) * digamma_beta_rho.sum()
+            
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+            digamma_beta_rho = np.zeros_like(self.beta_rho)
+            valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+            digamma_alpha_rho[valid_mask] = (
+                digamma(self.alpha_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            digamma_beta_rho[valid_mask] = (
+                digamma(self.beta_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            
+            # Term 2: q(\rho)
+            ELBO_temp += (
+                (self.alpha_rho - 1) * digamma_alpha_rho +
+                (self.beta_rho - 1) * digamma_beta_rho +
+                loggamma(self.alpha_rho + self.beta_rho) -
+                loggamma(self.alpha_rho) - loggamma(self.beta_rho)
+            ).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        self.ELBO_store_rho[CAVI_rep, idx] = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
+        
+    def _compute_full_ELBO(self, CAVI_rep: int, num_mc: int):
+        """
+        """
+        def compute_expected_log_joint():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+            digamma_beta_rho = np.zeros_like(self.beta_rho)
+            valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+            digamma_alpha_rho[valid_mask] = (
+                digamma(self.alpha_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            digamma_beta_rho[valid_mask] = (
+                digamma(self.beta_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 1: p(A | z, \rho)
+            adj_tensor_mask = self.adj_tensor.copy()
+            adj_tensor_sub_mask = self.adj_tensor.copy()
+            for l in range(self.num_layers):
+                np.fill_diagonal(adj_tensor_mask[l,:,:], 0)
+                np.fill_diagonal(adj_tensor_sub_mask[l,:,:], 0)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_mask, digamma_alpha_rho,
+                              optimize=True)
+            
+            ELBO_temp += np.einsum('lik,ljm,lij,km->', self.phi_u, self.phi_u, 
+                              adj_tensor_sub_mask, digamma_beta_rho,
+                              optimize=True)
+            
+            # Term 2: p(\rho)
+            ELBO_temp += (self.alpha_0 - 1) * digamma_alpha_rho.sum() 
+            ELBO_temp += (self.beta_0 - 1) * digamma_beta_rho.sum()
+            
+            # Term 3: p(z | w, \gamma)
+            cumsum_gamma = (
+                digamma_alpha_gamma + 
+                np.cumsum(digamma_beta_gamma, axis=1) -
+                digamma_beta_gamma
+                )
+                
+            ELBO_temp += np.einsum('lik,iw,wk->', self.phi_u, self.phi_w,
+                              cumsum_gamma,
+                              optimize=True)
+            
+            # Term 4: p(w | \tau)
+            # MC step for the expectation
+            tau_ik_samps = self._compute_tau(num_mc)
+            log_tau_expec = np.log(tau_ik_samps + 10e-10).mean(axis=2)
+            
+            ELBO_temp += np.einsum('iw,iw->', self.phi_w, log_tau_expec)
+            
+            # Term 5: p(\phi | \phi^0, \sigma^2)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -0.5 * self.P * (np.log(self.nu_sigma2[k]) - self.omega_sigma2[k]) -
+                    0.5 * self.nu_sigma2[k] / self.omega_sigma2[k] * (
+                        np.dot(self.theta_phi[k] - self.theta_phi0[k],
+                               self.theta_phi[k] - self.theta_phi0[k]) +
+                        np.trace(self.sigma_phi[k] + np.trace(self.sigma_phi0[k]))
+                    )
+                )
+                
+            # Term 6: p(\phi^0)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -0.5 * np.dot(self.theta_phi0[k] - self.mu,
+                                  self.theta_phi0[k] - self.mu) -
+                    0.5 * np.trace(self.sigma_phi0[k])
+                )
+                
+            # Term 7: p(\sigma^2)
+            for k in range(self.M_w):
+                ELBO_temp += (
+                    -(self.nu_0 + 1) * (np.log(self.nu_sigma2[k]) - self.omega_sigma2[k]) -
+                    self.omega_0 * self.nu_sigma2[k] / self.omega_sigma2[k]
+                )
+            
+            # Term 8: p(\gamma')
+            ELBO_temp += (self.nu_0 - 1) * digamma_beta_gamma.sum()
+            
+            return ELBO_temp
+        
+        def compute_expected_log_q():
+            """
+            """
+            ELBO_temp = 0
+            
+            digamma_alpha_rho = np.zeros_like(self.alpha_rho)
+            digamma_beta_rho = np.zeros_like(self.beta_rho)
+            valid_mask = (self.alpha_rho  > 0) & (self.beta_rho > 0)
+            digamma_alpha_rho[valid_mask] = (
+                digamma(self.alpha_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            digamma_beta_rho[valid_mask] = (
+                digamma(self.beta_rho[valid_mask]) 
+                - digamma(self.alpha_rho[valid_mask] + self.beta_rho[valid_mask])
+            )
+            
+            digamma_alpha_gamma = (
+                digamma(self.alpha_gamma) - digamma(self.alpha_gamma + self.beta_gamma)
+                )
+            digamma_beta_gamma = (
+                digamma(self.beta_gamma) - digamma(self.beta_gamma + self.beta_gamma)
+                )
+            
+            # Term 1: q(z)
+            ELBO_temp += (self.phi_u * np.log(self.phi_u + 10e-10)).sum()
+            
+            # Term 2: q(\rho)
+            ELBO_temp += (
+                (self.alpha_rho - 1) * digamma_alpha_rho +
+                (self.beta_rho - 1) * digamma_beta_rho +
+                loggamma(self.alpha_rho + self.beta_rho) -
+                loggamma(self.alpha_rho) - loggamma(self.beta_rho)
+            ).sum()
+            
+            # Term 3: q(w)
+            ELBO_temp += (self.phi_w * np.log(self.phi_w + 10e-10)).sum()
+            
+            # Term 4: q(gamma')
+            ELBO_temp += (
+                (self.alpha_gamma - 1) * digamma_alpha_gamma + 
+                (self.beta_gamma - 1) * digamma_beta_gamma +
+                loggamma(self.alpha_gamma + self.beta_gamma) -
+                loggamma(self.alpha_gamma) - loggamma(self.beta_gamma)
+            ).sum()
+            
+            # Term 5: q(\phi)
+            for k in range(self.M_w):
+                ELBO_temp += -0.5 * np.log(np.linalg.det(self.sigma_phi[k]) + 10e-10)
+            
+            # Term 6: q(\phi^0)
+            for k in range(self.M_w):
+                ELBO_temp += -0.5 * np.log(np.linalg.det(self.sigma_phi0[k]) + 10e-10)
+                
+            # Term 7: q(\sigma^2)
+            ELBO_temp += (
+                -(self.nu_sigma2 + 1) * (
+                    np.log(self.omega_sigma2 + 10e-10) - 
+                    digamma(self.omega_sigma2)
+                    )
+                - self.nu_sigma2 + self.nu_sigma2 * np.log(self.omega_sigma2 + 10e-10) 
+                - loggamma(self.nu_sigma2)
+            ).sum()
+            
+            return ELBO_temp
+        
+        # Compute and store
+        ELBO = (
+            compute_expected_log_joint() - compute_expected_log_q()
+        )
+            
+        return ELBO
+            
     def run_VB_scheme(self, n_CAVI_its: int, num_mc: int, num_grad_steps: int,
                       alpha: float=0.001, beta1: float=0.9, beta2: float=0.999, 
                       eps: float=10**-8):
@@ -905,48 +1109,87 @@ class VariationalBayes:
             - num_mc: number of MC samples for expectation estimates.
             - num_grad_steps: number of gradient ascent steps in the ADAM procedure.
         """
-        self.ELBO_store = np.zeros((n_CAVI_its, num_grad_steps, self.M_w))
+        # Initialise parameter values
+        self._initialise_parameters()
         
-        self.phi_w_track = np.zeros((n_CAVI_its + 1, self.num_nodes, self.M_w))
-        self.phi_w_track[0,:,:] = self.phi_w.copy()
-        self.phi_u_track = np.zeros((n_CAVI_its + 1, self.num_layers, 
+        # Empty arrays for storing ELBO values
+        self.ELBO_store_full = np.zeros((n_CAVI_its * 8, ))
+        self.ELBO_store_u = np.zeros((n_CAVI_its, 2))
+        self.ELBO_store_w = np.zeros((n_CAVI_its, 2))
+        self.ELBO_store_phi = np.zeros((n_CAVI_its, num_grad_steps, self.M_w))
+        self.ELBO_store_phi0 = np.zeros((n_CAVI_its, 2))
+        self.ELBO_store_sigma2 = np.zeros((n_CAVI_its, 2))
+        self.ELBO_store_gamma = np.zeros((n_CAVI_its, 2))
+        self.ELBO_store_rho = np.zeros((n_CAVI_its, 2))
+        
+        # Empty array for tracking estimates
+        self.phi_w_store = np.zeros((n_CAVI_its + 1, self.num_nodes, self.M_w))
+        self.phi_w_store[0,:,:] = self.phi_w.copy()
+        self.phi_u_store = np.zeros((n_CAVI_its + 1, self.num_layers, 
                                      self.num_nodes, self.M_u))
-        self.phi_u_track[0,:,:,:] = self.phi_u.copy()
-        self.phi_zeta_track = np.zeros((n_CAVI_its + 1, self.num_nodes, self.M_zeta))
-        self.phi_zeta_track[0,:,:] = self.phi_zeta.copy()
-        
+        self.phi_u_store[0,:,:,:] = self.phi_u.copy()
+        self.alpha_rho_store = np.zeros((n_CAVI_its + 1, self.M_u, self.M_u))
+        self.beta_rho_store = np.zeros((n_CAVI_its + 1, self.M_u, self.M_u))
+        self.alpha_rho_store[0] = self.alpha_rho
+        self.beta_rho_store[0] = self.beta_rho
+    
         for CAVI_rep in range(n_CAVI_its):
             print(f"Iteration {CAVI_rep + 1} of {n_CAVI_its}")
 
-            print("Updating u")
-            self._update_q_u()
-
-            print("Updating w")
-            self._update_q_w(num_mc)
-            self.phi_w_track[CAVI_rep + 1,:,:] = self.phi_w.copy()
+            print("Updating rho")
+            self._compute_ELBO_wrt_rho(CAVI_rep, 0)
+            self._update_q_rho()
+            self._compute_ELBO_wrt_rho(CAVI_rep, 1)
+            self._compute_full_ELBO(CAVI_rep, num_mc)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep] = ELBO_full
+            self.alpha_rho_store[CAVI_rep + 1] = self.alpha_rho
+            self.beta_rho_store[CAVI_rep + 1] = self.beta_rho
             
-            print("Updating zeta")
-            self._update_q_zeta()
-
+            print("Updating gamma")
+            self._compute_ELBO_wrt_gamma(CAVI_rep, 0)
+            self._update_q_gamma()
+            self._compute_ELBO_wrt_gamma(CAVI_rep, 1)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 1] = ELBO_full
+        
+            print("Updating phi_0")
+            self._compute_ELBO_wrt_phi0(CAVI_rep, num_mc, 0)
+            self._update_q_phi0()
+            self._compute_ELBO_wrt_phi0(CAVI_rep, num_mc, 1)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 2] = ELBO_full
+            
             print("Updating phi")
             self._update_q_phi(num_mc, num_grad_steps, CAVI_rep, alpha, beta1,
                                beta2, eps)
-            
-            print("Updating phi_0")
-            self._update_q_phi0()
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 3] = ELBO_full
             
             print("Updating sigma2")
+            self._compute_ELBO_wrt_sigma2(CAVI_rep, 0) 
             self._update_q_sigma2()
-            
-            print("Updating gamma")
-            self._update_q_gamma()
-            
-            print("Updating pi")
-            self._update_q_pi()
+            self._compute_ELBO_wrt_sigma2(CAVI_rep, 1)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 4] = ELBO_full
 
-            print("Updating rho")
-            self._update_q_rho()
+            print("Updating u")
+            self._compute_ELBO_wrt_u(CAVI_rep, 0)
+            self._update_q_u()
+            self._compute_ELBO_wrt_u(CAVI_rep, 1)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 5] = ELBO_full
+            self.phi_u_store[CAVI_rep + 1,:,:,:] = self.phi_u.copy()
 
+            print("Updating w")
+            self._compute_ELBO_wrt_w(CAVI_rep, num_mc, 0)
+            self._update_q_w(num_mc)
+            self._compute_ELBO_wrt_w(CAVI_rep, num_mc, 1)
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 6] = ELBO_full
+            self.phi_w_store[CAVI_rep + 1,:,:] = self.phi_w.copy()
             
-
-# %%
+            print("Computing ELBO")
+            ELBO_full = self._compute_full_ELBO(CAVI_rep, num_mc)
+            self.ELBO_store_full[8 * CAVI_rep + 7] = ELBO_full
+    
