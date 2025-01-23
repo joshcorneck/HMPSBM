@@ -1,11 +1,14 @@
 import numpy as np
 
 from scipy.stats import norm
+from scipy.stats import invgamma
 
 def create_orthogonal_sets(nodes_in_groups: np.array, 
                            perturbation_scale: float,
                            feat_dim: int):
     """
+    Method for producing sets of orthogonal vectors to be used as features in 
+    model simulation.
     Parameters:
         - nodes_in_groups: numpy array giving the number of nodes in
                            each of the global groups.
@@ -53,8 +56,13 @@ def create_orthogonal_sets(nodes_in_groups: np.array,
 class MultiplexSimulator:
 
     def __init__(self, num_nodes: int, num_layers: int, num_glob_groups: int,
-                 max_num_layer_groups: np.array, features: np.array):
+                 max_num_layer_groups: np.array, features: np.array,
+                 specify: bool=True, rho_matrix: np.array=None, 
+                 layer_groups: np.array=None, zeta: np.array=None, 
+                 phi: np.array=None, gamma: np.array=None,
+                 num_adj_samps: int=1):
         """
+        A class for simulating a multiplex network from the model.
         Parameters: 
             - num_nodes: N, number of nodes in the network.
             - num_layers: L, number of layers in the network.
@@ -66,20 +74,46 @@ class MultiplexSimulator:
         self.num_layers = num_layers
         self.num_glob_groups = num_glob_groups
         self.max_num_layer_groups = max_num_layer_groups
+        self.num_adj_samps = num_adj_samps
 
         self.features = features
+        self.P = features.shape[1]
         
-    def _sample_mu(self):
-        """
-        """
-        # num_feats = self.features.shape[1]
-        # self.mu = np.random.multivariate_normal(mean=np.zeros(num_feats),
-        #                                    cov=np.diag(np.ones(num_feats)))
-        num_feats = self.features.shape[1]
-        self.mu = np.random.multivariate_normal(mean=np.zeros(num_feats),
-                                           cov=np.diag(np.ones(num_feats)),
-                                           size=self.num_glob_groups)
-    
+        self.specify = specify
+        
+        # Checks
+        if self.specify:
+            if layer_groups is None:
+                raise ValueError("You must suuply layer_groups if specify = True.")
+            elif layer_groups.shape != (num_layers, num_nodes):
+                raise ValueError("The shape of layer_groups is incorrect.")
+            else:
+                self.layer_groups = layer_groups
+            if rho_matrix is None:
+                raise ValueError("""You must supply a connectivty matrix
+                                 if specify = True.""")
+        if rho_matrix is not None:
+            # M = max(num_glob_groups, max_num_layer_groups)
+            M = max_num_layer_groups
+            if rho_matrix.shape != (M, M):
+                raise ValueError("")
+        if zeta is not None:
+            if zeta.shape != (num_glob_groups, max_num_layer_groups):
+                raise ValueError("")
+        if phi is not None:
+            if phi.shape != (num_glob_groups, self.P):
+                raise ValueError("")
+        if gamma is not None:
+            if gamma.shape != (num_glob_groups, max_num_layer_groups):
+                raise ValueError("")
+        
+        self.rho_matrix = rho_matrix
+        self.zeta = zeta
+        self.phi = phi
+        self.gamma = gamma
+
+        # self.sigma2 = np.tile([0.005], self.num_glob_groups)
+
     def _sample_pi(self, xi_0):
         """
         """
@@ -101,6 +135,21 @@ class MultiplexSimulator:
 
         row_sums = self.gamma.sum(axis=1, keepdims=True)
         self.gamma /= row_sums
+        
+    def _sample_sigma2(self, nu_0, omega_0):
+        """
+        """
+        self.sigma2 = invgamma.rvs(nu_0, omega_0, size=(self.num_glob_groups, ))
+
+    def _sample_phi0(self, mu):
+        """
+        """
+        # num_feats = self.features.shape[1]
+        # self.mu = np.random.multivariate_normal(mean=np.zeros(num_feats),
+        #                                    cov=np.diag(np.ones(num_feats)))
+        self.phi0 = np.random.multivariate_normal(mean=mu,
+                                                  cov=np.eye(self.P),
+                                                  size=self.num_glob_groups)
 
     def _sample_phi(self):
         """
@@ -110,22 +159,19 @@ class MultiplexSimulator:
         #     cov=np.diag(np.ones(len(self.mu))),
         #     size=self.num_glob_groups
         # )
-        self.phi=np.zeros((self.num_glob_groups,  self.features.shape[1]))
+        self.phi = np.zeros((self.num_glob_groups, self.P))
         for k in range(self.num_glob_groups):
             self.phi[k,:] = np.random.multivariate_normal(
-                mean=self.mu[k,:],
-                cov=np.diag(np.ones(len(self.mu[k,:])))
-            )
+                mean=self.phi0[k,:],
+                cov=self.sigma2[k] * np.eye(self.P))
 
-    def _sample_delta(self):
+    def _compute_delta(self):
         """
         """
         self.delta = np.zeros((self.num_nodes, self.num_glob_groups))
         for i in range(self.num_nodes):
             for m in range(self.num_glob_groups):
-                self.delta[i,m] = np.random.normal(
-                    loc=np.dot(self.features[i,:], self.phi[m,:]), 
-                    scale=0.01 * np.dot(self.features[i,:], self.features[i,:]))
+                self.delta[i,m] = np.dot(self.features[i,:], self.phi[m,:])
 
     def _compute_tau(self):
         """
@@ -180,12 +226,11 @@ class MultiplexSimulator:
                 self.layer_groups[l,i] = self.zeta[self.glob_groups[i],
                                                    self.u[l,i]]
     
-    
     def _sample_rho(self, alpha_0, beta_0):
         """
         """
         M = max(self.num_glob_groups, self.max_num_layer_groups)
-        self.rho = np.random.beta(a=alpha_0, b=beta_0,
+        self.rho_matrix = np.random.beta(a=alpha_0, b=beta_0,
                                   size=(M, M))
 
     def _sample_adjacency_tensor(self):
@@ -195,30 +240,38 @@ class MultiplexSimulator:
             (self.num_layers, self.num_nodes,  self.num_nodes), dtype=int)
 
         layer_rho_matrices = [
-            self.rho[self.layer_groups[l, :].reshape(-1, 1), self.layer_groups[l, :]]
+            self.rho_matrix[self.layer_groups[l, :].reshape(-1, 1), self.layer_groups[l, :]]
             for l in range(self.num_layers)
         ]
 
         for l in range(self.num_layers):
-            random_nums = np.random.uniform(size=(self.num_nodes, self.num_nodes))
-            self.adjacency_tensor[l,:,:] = (
-                random_nums < layer_rho_matrices[l]
-            ).astype(int)
+            for rep in range(self.num_adj_samps):
+                random_nums = np.random.uniform(size=(self.num_nodes, self.num_nodes))
+                adjacency_tensor_temp = (
+                    random_nums < layer_rho_matrices[l]
+                ).astype(int)
+                self.adjacency_tensor[l,:,:] += adjacency_tensor_temp
 
-    def sample_network(self, xi_0, eta_0, alpha_0, beta_0):
+    def sample_network(self, xi_0=None, eta_0=None, alpha_0=None, beta_0=None, mu=None):
         """
         """
-        self._sample_mu()
-        self._sample_pi(xi_0=xi_0)
-        self._sample_gamma(eta_0=eta_0)
-        self._sample_phi()
-        self._sample_delta()
-        self._compute_tau()
-        self._sample_zeta()
-        self._sample_global_groups()
-        self._sample_u()
-        self._compute_layer_groups()
-        self._sample_rho(alpha_0=alpha_0, beta_0=beta_0)
-        self._sample_adjacency_tensor()
+        if self.specify:
+            self._sample_adjacency_tensor()
+        else:
+            self._sample_pi(xi_0=xi_0)
+            if self.gamma is None:
+                self._sample_gamma(eta_0=eta_0)
+            if self.phi is None:
+                self._sample_phi0(mu=mu)
+                self._sample_phi()
+            self._compute_delta()
+            self._compute_tau()
+            self._sample_zeta()
+            self._sample_global_groups()
+            self._sample_u()
+            self._compute_layer_groups()
+            if self.rho_matrix is None:
+                self._sample_rho(alpha_0=alpha_0, beta_0=beta_0)
+            self._sample_adjacency_tensor()
         
 
