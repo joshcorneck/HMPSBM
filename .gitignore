@@ -123,3 +123,21 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+## Data
+/data/POLECAT
+/data/BAAD
+/data/FAO
+
+## Archive
+/archive
+
+## Simulation output
+/simulations/ELBO
+/simulations/POLECAT
+/simulations/simulation_1
+/simulations/simulation_2
+/simulations/simulation_3
+/simulations/simulation_4
+/simulations/simulation_5
+/simulations/algorithm_testing

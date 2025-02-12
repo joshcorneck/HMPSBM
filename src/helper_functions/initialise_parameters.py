@@ -333,7 +333,7 @@ def initialise_phi_w(num_nodes: int, num_layers: int, k_max: int,
     
     
 def initialise_alpha_beta_rho(num_layers: int, M_u: int, adj_tensor: np.array,
-                              phi_u: np.array):
+                              phi_u: np.array, num_adj_samps: int):
     """
     Initiliase alpha_rho and beta_rho.
     
@@ -347,7 +347,7 @@ def initialise_alpha_beta_rho(num_layers: int, M_u: int, adj_tensor: np.array,
         - alpha_rho, beta_rho: initialised estimates.
     """
     # Empty array for connectivity estimate    
-    rho_estimate = np.zeros((num_layers, M_u, M_u))
+    rho_estimate = np.ones((num_layers, M_u, M_u)) * 10e-5
     for l in range(num_layers):
         adj_l = adj_tensor[l].copy()
         for k in range(M_u):
@@ -358,14 +358,14 @@ def initialise_alpha_beta_rho(num_layers: int, M_u: int, adj_tensor: np.array,
             for m in range(M_u):
                 if k == m:
                     adj_l_k_to_k = adj_l[idxs_k, idxs_k]
-                    rho_estimate[l,k,k] = adj_l_k_to_k.mean()
+                    rho_estimate[l,k,k] = adj_l_k_to_k.mean() / num_adj_samps
                 else:
                     # Get indices of nodes with latent group m
                     idxs_m = np.where(phi_u[l].argmax(axis=1) == m)[0]
                     if idxs_m.size == 0:
                         continue
                     adj_l_k_to_m = adj_l[np.ix_(idxs_k, idxs_m)]
-                    rho_estimate[l,k,m] = adj_l_k_to_m.mean()   
+                    rho_estimate[l,k,m] = adj_l_k_to_m.mean() / num_adj_samps     
     rho_estimate = rho_estimate.mean(axis=0)
 
     # There will be an error if rho == 1

@@ -23,7 +23,8 @@ class VariationalBayes:
 
     def __init__(self, num_nodes: int, num_layers: int, adj_tensor: np.array, 
                  features: np.array, M_w: int, M_z: int, 
-                 num_fp_its: int=1, k_max: int = 4, num_adj_samps: int=1) -> None:
+                 num_fp_its: int=1, k_max: int = 4, num_adj_samps: int=1,
+                 uniform_w: bool=False) -> None:
         """
         A class to compute a mean-field variational approximation to the posterior.
         Parameters:
@@ -44,6 +45,7 @@ class VariationalBayes:
         self.M_w = M_w; self.M_z = M_z        
         self.k_max = k_max
         self.num_adj_samps = num_adj_samps
+        self.uniform_w = uniform_w
             
         self.nu_sigma2 = np.ones((M_w, ))
         self.omega_sigma2 = np.ones((M_w, ))
@@ -81,14 +83,18 @@ class VariationalBayes:
                                                  self.k_max, self.M_z, self.adj_tensor)
         
         # Initialise phi_w
-        self.phi_w = initialise.initialise_phi_w(self.num_nodes, self.num_layers, 
-                                                 self.k_max, self.M_w, self.features, 
-                                                 self.adj_tensor)
+        if self.uniform_w:
+            self.phi_w = np.full((self.num_nodes, self.M_w), 1/self.M_w)
+        else:
+            self.phi_w = initialise.initialise_phi_w(self.num_nodes, self.num_layers, 
+                                                        self.k_max, self.M_w, self.features, 
+                                                        self.adj_tensor)
+            
         
         # Initialise alpha_rho and beta_rho
         self.alpha_rho, self.beta_rho = (
             initialise.initialise_alpha_beta_rho(self.num_layers, self.M_z, self.adj_tensor,
-                                                 self.phi_z)
+                                                 self.phi_z, self.num_adj_samps)
         )
         
         # Initialise alpha_gamma and beta_gamma
@@ -100,7 +106,6 @@ class VariationalBayes:
         # Initialise theta_phi, theta_phi0, sigma_phi and sigma_phi0
         self.theta_phi = np.stack(initialise.initialise_theta_phi(self.features, self.phi_w))
         self.theta_phi0 = np.ones((self.M_w, self.P))
-        print(f"Initialised theta_phi: {self.theta_phi}")
         
         cov_mat = np.cov(self.features.T)
         self.sigma_phi = np.ones((self.M_w, self.P, self.P))
@@ -543,6 +548,7 @@ class VariationalBayes:
                               num_layers=self.num_layers, num_nodes=self.num_nodes,
                               num_mc=self.num_mc, adj_tensor=self.adj_tensor,
                               M_u=self.M_z, M_w=self.M_w, P=self.P,
+                              num_adj_samps=self.num_adj_samps,
                               alpha_rho=self.alpha_rho, beta_rho=self.beta_rho,
                               alpha_0=self.alpha_0, beta_0=self.beta_0,
                               alpha_gamma=self.alpha_gamma, beta_gamma=self.beta_gamma,
@@ -564,6 +570,7 @@ class VariationalBayes:
                               num_layers=self.num_layers, num_nodes=self.num_nodes,
                               num_mc=self.num_mc, adj_tensor=self.adj_tensor,
                               M_u=self.M_z, M_w=self.M_w, P=self.P,
+                              num_adj_samps=self.num_adj_samps,
                               alpha_rho=self.alpha_rho, beta_rho=self.beta_rho,
                               alpha_0=self.alpha_0, beta_0=self.beta_0,
                               alpha_gamma=self.alpha_gamma, beta_gamma=self.beta_gamma,
@@ -584,7 +591,7 @@ class VariationalBayes:
                       max_ELBO_dec: int=5, max_ELBO_steady: int=3, 
                       max_ELBO_phi_dec: int=3,
                       alpha_set_theta: list=None, alpha_set_sigma: list=None,
-                      ADAM_type: str='joint', lr_theta: float=None,
+                      ADAM_type: str='single', lr_theta: float=None,
                       lr_sigma: float=None, lr_decay: float=0.9, 
                       multiple_lr: bool=False):
         """
@@ -619,6 +626,21 @@ class VariationalBayes:
         self.beta_rho_store = np.zeros((n_CAVI_its + 1, self.M_z, self.M_z))
         self.alpha_rho_store[0] = self.alpha_rho
         self.beta_rho_store[0] = self.beta_rho
+        
+        # Empty arrays for storing best values
+        self.alpha_rho_best = np.zeros_like(self.alpha_rho)
+        self.beta_rho_best = np.zeros_like(self.beta_rho)
+        self.alpha_gamma_best = np.zeros_like(self.alpha_gamma)
+        self.beta_gamma_best = np.zeros_like(self.beta_gamma)
+        self.theta_phi0_best = np.zeros_like(self.theta_phi0)
+        self.sigma_phi0_best = np.zeros_like(self.sigma_phi0)
+        self.theta_phi_best = np.zeros_like(self.theta_phi)
+        self.sigma_phi_best = np.zeros_like(self.sigma_phi)
+        self.nu_sigma2_best = np.zeros_like(self.nu_sigma2)
+        self.omega_sigma2_best = np.zeros_like(self.omega_sigma2)
+        self.phi_w_best = np.zeros_like(self.phi_w)
+        self.phi_z_best = np.zeros_like(self.phi_z)
+        
     
         ELBO_dec_track = 0 # Tracker for ELBO decreasing
         ELBO_steady_track = 0 # Tracker for ELBO staying steady
@@ -629,90 +651,100 @@ class VariationalBayes:
                 lr_theta *= lr_decay
                 lr_sigma *= lr_decay
             print(f"...Iteration {CAVI_rep + 1} of {n_CAVI_its}...")
-
-            print("Updating rho", end='\r')
-            # print("Updating rho")
-            ELBO_full = self._compute_full_ELBO()
-            print(f"ELBO before: {ELBO_full}")
+            
+            if CAVI_rep == 0:
+                ELBO_init = self._compute_full_ELBO()
+                print(f"ELBO_init: {ELBO_init}")
+                
+            print("...Updating rho...")
             self._update_q_rho()
-            self.alpha_rho_store[CAVI_rep + 1] = self.alpha_rho
-            self.beta_rho_store[CAVI_rep + 1] = self.beta_rho
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after rho: {ELBO_val}")
             
-            print("Updating gamma", end='\r')
-            # print("Updating gamma")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
+            print("...Updating gamma...")
             self._update_q_gamma()
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after gamma: {ELBO_val}")
         
-            print("Updating phi_0", end='\r')
-            # print("Updating phi_0")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
+            print("...Updating phi_0...")
             self._update_q_phi0()
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after phi_0: {ELBO_val}")
             
-            print("Updating phi", end='\r')
-            # print("Updating phi")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
+            print("...Updating phi...")
             self._update_q_phi(num_mc, max_num_grad_steps, CAVI_rep, alpha, beta1,
-                               beta2, eps, eps_ELBO=eps_ELBO_phi, alpha_set_theta=alpha_set_theta,
+                               beta2, eps, eps_ELBO=eps_ELBO_phi, 
+                               alpha_set_theta=alpha_set_theta,
                                alpha_set_sigma=alpha_set_sigma,
                                max_decrease_count=max_ELBO_phi_dec,
                                ADAM_type=ADAM_type, lr_theta=lr_theta,
                                lr_sigma=lr_sigma, multiple_lr=multiple_lr)
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after phi: {ELBO_val}")
             
-            print("Updating sigma2", end='\r')
-            # print("Updating sigma2")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
+            print("...Updating sigma2...")
             self._update_q_sigma2()
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
-
-            print("Updating u", end='\r')
-            # print("Updating u")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
-            self._update_q_z()
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO after: {ELBO_full}")
-
-            print("Updating w", end='\r')
-            # print("Updating w")
-            # ELBO_full = self._compute_full_ELBO()
-            # print(f"ELBO before: {ELBO_full}")
-            self._update_q_w(num_mc)
-            ELBO_full = self._compute_full_ELBO()
-            print(f"ELBO after: {ELBO_full}")
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after sigma2: {ELBO_val}")
             
-            self.ELBO_store_full[CAVI_rep] = ELBO_full
+            print("...Updating z...")
+            self._update_q_z()
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after z: {ELBO_val}")
+            
+            print("...Updating w...")
+            self._update_q_w(num_mc)
+            ELBO_val = self._compute_full_ELBO()
+            print(f"ELBO after w: {ELBO_val}")
+            
+            ELBO_track = self._compute_full_ELBO()
+            
+            print(f"ELBO_track: {ELBO_track}")
+            
+            self.ELBO_store_full[CAVI_rep] = ELBO_track
+            self.alpha_rho_store[CAVI_rep + 1] = self.alpha_rho.copy()
+            self.beta_rho_store[CAVI_rep + 1] = self.beta_rho.copy()
+            self.phi_z_store[CAVI_rep + 1,:,:,:] = self.phi_z.copy()
             self.phi_w_store[CAVI_rep + 1,:,:] = self.phi_w.copy()
             
+            if CAVI_rep == 0:
+                ELBO_best = ELBO_track
+                
+                # Update best parameter estimates
+                self.alpha_rho_best = self.alpha_rho.copy()
+                self.beta_rho_best = self.beta_rho.copy()
+                self.alpha_gamma_best = self.alpha_gamma.copy()
+                self.beta_gamma_best = self.beta_gamma.copy()
+                self.theta_phi0_best = self.theta_phi0.copy()
+                self.sigma_phi0_best = self.sigma_phi0.copy()
+                self.theta_phi_best = self.theta_phi.copy()
+                self.sigma_phi_best = self.sigma_phi.copy()
+                self.nu_sigma2_best = self.nu_sigma2.copy()
+                self.omega_sigma2_best = self.omega_sigma2.copy()
+                self.phi_w_best = self.phi_w.copy()
+                self.phi_z_best = self.phi_z.copy()
+                
             if CAVI_rep > 0:
-                if ELBO_full < ELBO_track:
+                if ELBO_track < ELBO_best:
                     ELBO_dec_track += 1
-                    print(f"ELBO decreased {ELBO_dec_track}", end='\r')
 
                     if ELBO_dec_track == max_ELBO_dec: 
-                        print("Stop.")
+                        print("...Maximimal ELBO decreases reached...")
                         break
                 else:
+                    ELBO_best = ELBO_track
                     ELBO_dec_track = 0
-                    if ((ELBO_full - ELBO_track) / ELBO_track < eps_ELBO_full):
-                        ELBO_steady_track += 1
-                        # print(f"ELBO steady {ELBO_steady_track}")
-                        
-                        # # if ELBO_steady_track == max_ELBO_steady:
-                        # #     print("ELBO converged.")
-                        # #     break
-                    else:
-                        ELBO_steady_track = 0
-            ELBO_track = ELBO_full
+                    
+                    # Update best parameter estimates
+                    self.alpha_rho_best = self.alpha_rho.copy()
+                    self.beta_rho_best = self.beta_rho.copy()
+                    self.alpha_gamma_best = self.alpha_gamma.copy()
+                    self.beta_gamma_best = self.beta_gamma.copy()
+                    self.theta_phi0_best = self.theta_phi0.copy()
+                    self.sigma_phi0_best = self.sigma_phi0.copy()
+                    self.theta_phi_best = self.theta_phi.copy()
+                    self.sigma_phi_best = self.sigma_phi.copy()
+                    self.nu_sigma2_best = self.nu_sigma2.copy()
+                    self.omega_sigma2_best = self.omega_sigma2.copy()
+                    self.phi_w_best = self.phi_w.copy()
+                    self.phi_z_best = self.phi_z.copy()

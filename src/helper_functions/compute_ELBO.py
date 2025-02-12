@@ -1,5 +1,6 @@
 import numpy as np
-from scipy.special import loggamma, digamma
+from scipy.special import loggamma, digamma, comb
+
 
 ## Functions for computing the log joint
 def precompute_values(alpha_rho: np.array, beta_rho: np.array,
@@ -23,24 +24,31 @@ def precompute_values(alpha_rho: np.array, beta_rho: np.array,
         digamma(alpha_gamma) - digamma(alpha_gamma + beta_gamma)
         )
     digamma_beta_gamma = (
-        digamma(beta_gamma) - digamma(beta_gamma + beta_gamma)
+        digamma(beta_gamma) - digamma(alpha_gamma + beta_gamma)
         )
     
     return (digamma_alpha_rho, digamma_beta_rho, 
             digamma_alpha_gamma, digamma_beta_gamma)
 
-def log_joint_term1(num_layers: int, adj_tensor: np.array,
-                    phi_u: np.array, 
+def log_joint_term1(num_layers: int, num_nodes: int, adj_tensor: np.array,
+                    phi_u: np.array, num_adj_samps: int,
                     digamma_alpha_rho: np.array,
                     digamma_beta_rho: np.array):
     """
     Term 1: p(A | z, \rho)
     """
     adj_tensor_mask = adj_tensor.copy()
-    adj_tensor_sub_mask = (1 - adj_tensor).copy()
+    adj_tensor_sub_mask = (num_adj_samps - adj_tensor).copy()
     for l in range(num_layers):
         np.fill_diagonal(adj_tensor_mask[l,:,:], 0)
         np.fill_diagonal(adj_tensor_sub_mask[l,:,:], 0)
+    
+    # Precompute matrix of M choose A_{\ell ij}
+    log_M_choose = np.zeros_like(adj_tensor, dtype=float)
+    for l in range(num_layers):
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                log_M_choose[l,i,j] = np.log(comb(num_adj_samps, adj_tensor[l,i,j], exact=False))
     
     ELBO_temp = np.einsum('lik,ljm,lij,km->', phi_u, phi_u, 
                     adj_tensor_mask, digamma_alpha_rho,
@@ -48,6 +56,9 @@ def log_joint_term1(num_layers: int, adj_tensor: np.array,
     
     ELBO_temp += np.einsum('lik,ljm,lij,km->', phi_u, phi_u, 
                     adj_tensor_sub_mask, digamma_beta_rho,
+                    optimize=True)
+    
+    ELBO_temp += np.einsum('lik,ljm,lij->', phi_u, phi_u, log_M_choose,
                     optimize=True)
     
     return ELBO_temp
@@ -235,6 +246,7 @@ def expec_log_q_term7(nu_sigma2: np.array, omega_sigma2: np.array):
 def compute_full_ELBO(ELBO_parameter: str, _compute_log_tau, num_layers: int, 
                       num_nodes: int, adj_tensor: np.array,
                       num_mc: int, M_u: int, M_w: int, P: int, 
+                      num_adj_samps: int,
                       alpha_rho: np.array, beta_rho: np.array,
                       alpha_0: float, beta_0: float,
                       alpha_gamma: np.array, beta_gamma: np.array,
@@ -266,8 +278,8 @@ def compute_full_ELBO(ELBO_parameter: str, _compute_log_tau, num_layers: int,
             if ELBO_parameter in {"z", "rho", "full"}:            
                 # Term 1: p(A | z, \rho)
                 expected_log_joint += log_joint_term1(
-                    num_layers, adj_tensor, phi_u, 
-                    digamma_alpha_rho, digamma_beta_rho
+                    num_layers, num_nodes, adj_tensor, phi_u, 
+                    num_adj_samps, digamma_alpha_rho, digamma_beta_rho
                 )
             
             if ELBO_parameter in {"rho", "full"}: 

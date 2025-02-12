@@ -69,6 +69,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
 
         decrease_counter = 0
         end_step_reduct = False
+        # print(f"...Updating theta_{k}...")
         for step in range(max_num_grad_steps):
             print(f"...theta_{k} iteration {step + 1}...", end='\r')
             ## Do ADAM for the inner loop.
@@ -124,7 +125,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
             
             ## Checking ELBO
             if ELBO_curr_k > ELBO_best_k:
-                print("ELBO increased", end='\r')
+                # print("ELBO increased", end='\r')
                 ELBO_best_k = ELBO_curr_k # Update the best ELBO
                 decrease_counter = 0 # Set decreasing counter to 0
                 
@@ -136,7 +137,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
                 # Increase steps
                 step_theta[k] += 1
             else:
-                print("ELBO decreased", end='\r')
+                # print("ELBO decreased", end='\r')
                 decrease_counter += 1
                 # Increase steps
                 step_theta[k] += 1
@@ -144,7 +145,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
                     # Shift the number of steps back
                     step_theta[k] -= int(decrease_counter)
                     end_step_reduct = True
-                    print("Maximum number of decreases reached.", end='\r')
+                    # print("Maximum number of decreases reached.", end='\r')
                     break
         
         if not end_step_reduct:
@@ -158,9 +159,11 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
         # Compute initial ELBO value
         ELBO_best_k = _compute_phi_ELBO(theta_phi=theta_phi_best,
                                         sigma_phi=sigma_phi_best)
+        # print(f"Initial ELBO_best_k_sigma: {ELBO_best_k}")
         
         decrease_counter = 0
         end_step_reduct = False
+        # print(f"...Updating Sigma_{k}...")
         for step in range(max_num_grad_steps):
             print(f"...Sigma_{k} iteration {step + 1}...", end='\r')
             ## Do ADAM for the inner loop.
@@ -219,7 +222,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
                 
             ## Checking ELBO
             if ELBO_curr_k > ELBO_best_k:
-                print("ELBO increased", end='\r')
+                # print("ELBO increased", end='\r')
                 ELBO_best_k = ELBO_curr_k # Update the best ELBO
                 decrease_counter = 0 # Set decreasing counter to 0
                 
@@ -241,7 +244,7 @@ def ADAM_single(theta_phi: np.array, sigma_phi: np.array, phi_w: np.array,
                     # Shift the number of steps back
                     step_sigma[k] -= int(decrease_counter)
                     end_step_reduct = True
-                    print("Maximum number of decreases reached.", end='\r')
+                    # print("Maximum number of decreases reached.", end='\r')
                     break
                 
     if not end_step_reduct:
