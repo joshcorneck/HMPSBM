@@ -127,7 +127,12 @@ dmypy.json
 ## Data
 /data/POLECAT
 /data/BAAD
-/data/FAO
+/data/FAO/output
+/data/FAO/output_features
+/data/FAO/plots
+/data/FAO/exploration_FAO.ipynb
+/data/FAO/submit_FAO.pbs
+/data/FAO/submit_FAO_features.pbs
 
 ## Archive
 /archive
@@ -135,9 +140,30 @@ dmypy.json
 ## Simulation output
 /simulations/ELBO
 /simulations/POLECAT
-/simulations/simulation_1
-/simulations/simulation_2
-/simulations/simulation_3
-/simulations/simulation_4
-/simulations/simulation_5
+/simulations/simulation_1/output
+/simulations/simulation_1/plots
+/simulations/simulation_1/submit.pbs
+
+/simulations/simulation_2/output
+/simulations/simulation_2/plots
+/simulations/simulation_2/submit.pbs
+/simulations/simulation_2/output_uni
+/simulations/simulation_2/submit_uni.pbs
+
+/simulations/simulation_3/output
+/simulations/simulation_3/plots
+/simulations/simulation_3/submit.pbs
+
+/simulations/simulation_4/output
+/simulations/simulation_4/plots
+/simulations/simulation_4/submit.pbs
+
+/simulations/simulation_5/output
+/simulations/simulation_5/plots
+/simulations/simulation_5/submit.pbs
+
 /simulations/algorithm_testing
+
+code_testing.ipynb
+
+/analyses

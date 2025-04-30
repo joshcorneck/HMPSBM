@@ -1,3 +1,7 @@
+"""
+A script to run the VB procedure.
+"""
+
 import numpy as np
 import math
 
@@ -228,30 +232,7 @@ class VariationalBayes:
             phi_k_samps = phi_k_samps.T
         
         return phi_k_samps
-        
-    # def _sample_phi(self, num_mc: int, theta_phi: np.array, sigma_phi: np.array,
-    #                 single: bool=False):
-    #     """
-    #     A method to sample values for phi for the current estimates of
-    #     the variationl parameters.
-    #     Parameters:
-    #         - num_mc: the number of MC samples.
-    #     """
-    #     if not single:
-    #         phi_k_samps = np.zeros((self.M_w, self.P, num_mc))
-    #         rng = np.random.default_rng() # Speed improvement with this sampler
-    #         for k in range(self.M_w):
-    #             phi_k_samps[k,:,:] = rng.multivariate_normal(theta_phi[k,:],
-    #                                                         sigma_phi[k,:,:],
-    #                                                         size=num_mc).T
-    #     else:
-    #         rng = np.random.default_rng() # Speed improvement with this sampler
-    #         phi_k_samps = rng.multivariate_normal(theta_phi,
-    #                                               sigma_phi,
-    #                                               size=num_mc)
 
-    #     return phi_k_samps
-    
     def _compute_log_tau(self, num_mc: int, phi_k_samps: np.array = None, theta_phi: np.array = None,
                      sigma_phi: np.array = None, return_norm: bool = False):
         """
@@ -281,40 +262,6 @@ class VariationalBayes:
         log_tau_ik_samps_normalised = log_tau_ik_samps - log_norm_ik_samps
     
         return log_tau_ik_samps_normalised
-        
-    # def _compute_tau(self, num_mc: int, phi_k_samps: np.array = None, theta_phi: np.array = None,
-    #                      sigma_phi: np.array = None, return_norm: bool = False):
-    #     """
-    #     """
-    #     ## THIS IS NOW DONE ON A LOG-SCALE
-    #     if phi_k_samps is None:
-    #         phi_k_samps = self._sample_phi(num_mc, theta_phi, sigma_phi)
-        
-    #     delta_ik_samps = np.zeros((self.num_nodes, self.M_w, num_mc))
-    #     for i in range(self.num_nodes):
-    #         for k in range(self.M_w):
-    #             delta_ik_samps[i,k,:] = np.dot(self.features[i,:], phi_k_samps[k])
-                
-    #     log_tau_ik_samps = np.zeros_like(delta_ik_samps)
-    #     for i in range(self.num_nodes):
-    #         for k in range(self.M_w):
-    #             if k == 0:
-    #                 log_tau_ik_samps[i,k,:] = norm.logcdf(delta_ik_samps[i,k,:])
-    #             else:
-    #                 log_tau_ik_samps[i,k,:] = (
-    #                     norm.logcdf(delta_ik_samps[i,k,:]) +
-    #                     norm.logcdf(-delta_ik_samps[i,:k,:]).sum(axis=0)
-    #                 )
-                    
-    #     # Normalise
-    #     log_norm_ik_samps = logsumexp(log_tau_ik_samps, axis=1, keepdims=True)
-    #     norm_ik_samps = np.exp(logsumexp(log_tau_ik_samps, axis=1, keepdims=True))
-    #     tau_ik_samps = np.exp(log_tau_ik_samps - log_norm_ik_samps)
-        
-    #     if return_norm:
-    #         return tau_ik_samps, norm_ik_samps 
-    #     else:
-    #         return tau_ik_samps
     
     def _update_q_w(self, num_mc: int):
         """
@@ -593,13 +540,26 @@ class VariationalBayes:
                       alpha_set_theta: list=None, alpha_set_sigma: list=None,
                       ADAM_type: str='single', lr_theta: float=None,
                       lr_sigma: float=None, lr_decay: float=0.9, 
-                      multiple_lr: bool=False):
+                      multiple_lr: bool=False, verbose: int=1):
         """
         Run the full VB update scheme.
         Parameter:
             - n_CAVI_its: number of CAVI iterations.
             - num_mc: number of MC samples for expectation estimates.
             - max_num_grad_steps: number of gradient ascent steps in the ADAM procedure.
+            - max_ELBO_dec: maximum number of consecutive steps with no increase in ELBO.
+            - max_ELBO_steady: maximum number of steps with no significant increase (determined
+                               by eps_ELBO_phi and eps_ELBO_full).
+            - ADAM_type: multiple options of ADAM scheme from (use single).
+            - alpha_set_theta, alpha_set_sigma: sets of alpha parameters for ADAM if the user wants
+                                                to test multiple values. Otherwise leave as None.
+            - lr_theta, lr_sigma: choice of single learning rate, one for each of the parameters as
+                                  they function on different scales.
+            - lr_decay: decay rate for the learning rate of ADAM.
+            - multiple_lr: Boolean for whether we input mutliple learning rates or just one. 
+            - alpha, beta1, beta2, eps: ADAM paramemeters.
+            - verbose: if verbose = 1 then print only what stage of process, if verbose = 2
+                       then print stage and ELBO, otherwise print nothing.
         """
         if ADAM_type not in ['joint', 'joint torch', 'single', 'single torch']:
             raise ValueError("""
@@ -650,28 +610,37 @@ class VariationalBayes:
             if CAVI_rep > 0:
                 lr_theta *= lr_decay
                 lr_sigma *= lr_decay
-            print(f"...Iteration {CAVI_rep + 1} of {n_CAVI_its}...")
+            if verbose == 1:
+                print(f"...Iteration {CAVI_rep + 1} of {n_CAVI_its}...")
             
             if CAVI_rep == 0:
                 ELBO_init = self._compute_full_ELBO()
-                print(f"ELBO_init: {ELBO_init}")
-                
-            print("...Updating rho...")
+                if (verbose == 2):
+                    print(f"ELBO_init: {ELBO_init}")
+            
+            if ((verbose == 1) | (verbose == 2)): 
+                print("...Updating rho...")
             self._update_q_rho()
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after rho: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after rho: {ELBO_val}")
             
-            print("...Updating gamma...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating gamma...")
             self._update_q_gamma()
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after gamma: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after gamma: {ELBO_val}")
         
-            print("...Updating phi_0...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating phi_0...")
             self._update_q_phi0()
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after phi_0: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after phi_0: {ELBO_val}")
             
-            print("...Updating phi...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating phi...")
             self._update_q_phi(num_mc, max_num_grad_steps, CAVI_rep, alpha, beta1,
                                beta2, eps, eps_ELBO=eps_ELBO_phi, 
                                alpha_set_theta=alpha_set_theta,
@@ -680,26 +649,33 @@ class VariationalBayes:
                                ADAM_type=ADAM_type, lr_theta=lr_theta,
                                lr_sigma=lr_sigma, multiple_lr=multiple_lr)
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after phi: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after phi: {ELBO_val}")
             
-            print("...Updating sigma2...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating sigma2...")
             self._update_q_sigma2()
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after sigma2: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after sigma2: {ELBO_val}")
             
-            print("...Updating z...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating z...")
             self._update_q_z()
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after z: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after z: {ELBO_val}")
             
-            print("...Updating w...")
+            if ((verbose == 1) | (verbose == 2)):
+                print("...Updating w...")
             self._update_q_w(num_mc)
             ELBO_val = self._compute_full_ELBO()
-            print(f"ELBO after w: {ELBO_val}")
+            if (verbose == 2):
+                print(f"ELBO after w: {ELBO_val}")
             
             ELBO_track = self._compute_full_ELBO()
-            
-            print(f"ELBO_track: {ELBO_track}")
+            if (verbose == 2):
+                print(f"ELBO_track: {ELBO_track}")
             
             self.ELBO_store_full[CAVI_rep] = ELBO_track
             self.alpha_rho_store[CAVI_rep + 1] = self.alpha_rho.copy()

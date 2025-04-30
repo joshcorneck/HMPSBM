@@ -1,0 +1,17 @@
+#bin/bash
+#PBS -N simulation_1
+#PBS be
+#PBS -o ${HOME}/sandia/sandia_code/simulations/simulation_1/output/o_files/output.log
+#PBS -e ${HOME}/sandia/sandia_code/simulations/simulation_1/output/e_files/error.log
+#PBS -q parallel6
+#PBS -t 0-299
+
+echo "PBS_ARRAYID is set to: ${PBS_ARRAYID}"
+
+cd ${HOME}/sandia/sandia_code/simulations/simulation_1
+export PYTHONPATH=${HOME}/sandia/sandia_code
+
+source ${HOME}/sandia/sandia_venv/bin/activate
+
+python3 -u generate_layer_groups_1.py > "output/progress_output/generate_layer_groups_$PBS_ARRAYID.out"
+python3 -u simulation_1.py > "output/progress_output/simulation_1_output_$PBS_ARRAYID.out"

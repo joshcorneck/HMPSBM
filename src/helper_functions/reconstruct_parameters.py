@@ -1,4 +1,9 @@
 
+"""
+A script containing functions for reconstructing parameters that 
+are derived.
+"""
+
 import numpy as np
 from scipy.stats import norm
 

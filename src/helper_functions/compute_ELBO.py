@@ -1,3 +1,7 @@
+"""
+A script containing all functions necessary to compute the ELBO.
+"""
+
 import numpy as np
 from scipy.special import loggamma, digamma, comb
 

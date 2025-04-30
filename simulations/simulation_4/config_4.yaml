@@ -1,0 +1,27 @@
+0:
+  num_nodes: 100
+  num_samps: 1
+1:
+  num_nodes: 100
+  num_samps: 3
+2:
+  num_nodes: 100
+  num_samps: 5
+3:
+  num_nodes: 250
+  num_samps: 1
+4:
+  num_nodes: 250
+  num_samps: 3
+5:
+  num_nodes: 250
+  num_samps: 5
+6:
+  num_nodes: 500
+  num_samps: 1
+7:
+  num_nodes: 500
+  num_samps: 3
+8:
+  num_nodes: 500
+  num_samps: 5

@@ -1,3 +1,7 @@
+"""
+A script containing all functions necessary for informed initialisation.
+"""
+
 import numpy as np
 import hdbscan
 
@@ -42,38 +46,6 @@ def fit_single_probit(X: np.array, y: np.array, method: str = 'L-BFGS-B'):
     )
     
     return result.x
-
-# def initialise_theta_phi(X: np.array, taus: np.array, method: str = 'L-BFGS-B'):
-#     """
-#     Fit sequential probit model using sequential regression approach
-    
-#     Parameters:
-#         - X: feature matrix (N x P)
-#         - taus: probability values (N x M_w)
-#         - method: method for the optimiser.
-    
-#     Returns:
-#         - List of fitted phi_k vectors
-#     """
-#     N, P = X.shape
-#     M_w = taus.shape[1]
-#     phis = []
-    
-#     # Storage for intermediate products
-#     products = np.ones(N)
-    
-#     for k in range(M_w):
-#         # Compute target for this probit regression
-#         y = taus[:,k] / (products + 10e-5)
-        
-#         # Fit probit regression
-#         phi_k = fit_single_probit(X, y)
-#         phis.append(phi_k)
-        
-#         # Update products for next iteration
-#         products *= (1 - norm.cdf(X @ phi_k))
-        
-#     return phis
 
 def initialise_theta_phi(X: np.array, taus: np.array):
     """

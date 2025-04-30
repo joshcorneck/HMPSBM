@@ -1,3 +1,7 @@
+"""
+A script containing functions for computing the gradient for phi.
+"""
+
 import numpy as np
 
 from scipy.stats import norm

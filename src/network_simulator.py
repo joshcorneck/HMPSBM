@@ -1,3 +1,8 @@
+"""
+A script containing classes and functions necessary to sample from
+a network with global structure.
+"""
+
 import numpy as np
 
 from scipy.stats import norm
@@ -144,9 +149,6 @@ class MultiplexSimulator:
     def _sample_phi0(self, mu):
         """
         """
-        # num_feats = self.features.shape[1]
-        # self.mu = np.random.multivariate_normal(mean=np.zeros(num_feats),
-        #                                    cov=np.diag(np.ones(num_feats)))
         self.phi0 = np.random.multivariate_normal(mean=mu,
                                                   cov=np.eye(self.P),
                                                   size=self.num_glob_groups)
@@ -154,11 +156,6 @@ class MultiplexSimulator:
     def _sample_phi(self):
         """
         """
-        # self.phi = np.random.multivariate_normal(
-        #     mean=self.mu,
-        #     cov=np.diag(np.ones(len(self.mu))),
-        #     size=self.num_glob_groups
-        # )
         self.phi = np.zeros((self.num_glob_groups, self.P))
         for k in range(self.num_glob_groups):
             self.phi[k,:] = np.random.multivariate_normal(
